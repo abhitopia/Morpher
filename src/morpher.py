@@ -413,7 +413,7 @@ class Morpher(nn.Module):
             dropout_p=self.dropout_p if (self.training and torch.is_grad_enabled()) else 0.0
         )  
         attn_out = self.dropout_attn(attn_out)
-        attn_out = attn_out.permute(0, 2, 1, 3).view(B, T, N, self.K, self.d)  # [B, T, N, K, d]
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, T, N, self.K, self.d)
         attn_out = attn_out + z_active
 
         # Update active slots with attention output (non-in-place to preserve gradients)
