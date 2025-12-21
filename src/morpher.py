@@ -16,6 +16,7 @@ import torch.nn.functional as F
 def lcm(a: int, b: int) -> int:
     return a * b // gcd(a, b)
 
+
 def lcm_list(xs: List[int]) -> int:
     return reduce(lcm, xs, 1)
 

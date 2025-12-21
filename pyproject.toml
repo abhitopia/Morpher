@@ -22,9 +22,17 @@ adam-atan2 = {version = ">=0.0.3,<0.0.4", optional = true}
 
 [tool.poetry.group.dev.dependencies]
 ipdb = ">=0.13.13,<1.0.0"
+ruff = ">=0.8.0,<1.0.0"
+mypy = ">=1.13.0,<2.0.0"
 
 [tool.poetry.extras]
 cuda = ["adam-atan2"]
+
+[tool.ruff]
+exclude = ["external/"]
+
+[tool.mypy]
+exclude = ["external/"]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
