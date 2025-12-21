@@ -11,6 +11,26 @@ def lcm(a, b): return a * b // gcd(a, b)
 def lcm_list(xs): return reduce(lcm, xs, 1)
 
 
+class Dropout(nn.Module):
+    """
+    Dropout that is active only when:
+      - module is in training mode, AND
+      - gradients are enabled (i.e. not inside torch.no_grad()/inference_mode())
+    """
+    def __init__(self, p: float = 0.5, inplace: bool = False):
+        super().__init__()
+        if not (0.0 <= p <= 1.0):
+            raise ValueError(f"p must be in [0,1], got {p}")
+        self.p = float(p)
+        self.inplace = inplace
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        training_now = self.training and torch.is_grad_enabled()
+        if self.p == 0.0 or not training_now:
+            return x
+        return F.dropout(x, p=self.p, training=True, inplace=self.inplace)
+
+
 class StreamLoRAEncoder(nn.Module):
     """
     Projects input features to multiple independent streams using LoRA adapters.
@@ -185,8 +205,8 @@ class Morpher(nn.Module):
         self.head_input_scope = head_input_scope
         self.dropout_p = dropout
 
-        self.dropout_mixer = nn.Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
-        self.dropout_attn = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.dropout_mixer = Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
+        self.dropout_attn = Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
 
 
         # K: Number of active slots/heads per stream per step
@@ -390,29 +410,59 @@ class Morpher(nn.Module):
         attn_out = F.scaled_dot_product_attention(  # [B, N*K, T, d]
             queries, keys, values, 
             is_causal=is_causal, 
-            dropout_p=self.dropout_p if self.training else 0.0
+            dropout_p=self.dropout_p if (self.training and torch.is_grad_enabled()) else 0.0
         )  
         attn_out = self.dropout_attn(attn_out)
         attn_out = attn_out.permute(0, 2, 1, 3).view(B, T, N, self.K, self.d)  # [B, T, N, K, d]
         attn_out = attn_out + z_active
 
-        # Update active slots with attention output (in-place)
-        z_slots[:, :, :, active_slots, :] = attn_out  # [B, T, N, K, d]
+        # Update active slots with attention output (non-in-place to preserve gradients)
+        z_slots_next = z_slots.clone()  # Clone to avoid in-place modification
+        z_slots_next[:, :, :, active_slots, :] = attn_out  # [B, T, N, K, d]
 
-        z_next = z_slots.view(B, T, N, self.D)
+        z_next = z_slots_next.view(B, T, N, self.D)
 
         return z_next
 
+    def forward_cycle(self, z: torch.Tensor, t0: int, is_causal: bool) -> torch.Tensor:
+        for dt in range(self.N):
+            z = self.step(z=z, t=t0 + dt, is_causal=is_causal)
+        return z
 
-    def forward(self, x, R: int, is_causal: bool):
-        # Encoder outputs [B, T, N, D] - step function now handles this format
-        z = self.encoder(x)
 
-        z = self.step(z=z, t=0, is_causal=is_causal)
+    def forward(self, x, R: int, is_causal: bool, grad_cycles: int = 1):
+        """
+        R: total macro-steps (periods)
+        grad_cycles: number of final macro-steps to backprop through
+                    (1 = only last cycle has true recurrence grads)
+        """
+        assert 1 <= grad_cycles <= R
+        burn_periods = R - grad_cycles
+
+        # Transforms [B, T, io_dim] -> [B, T, N, D]
+        z0 = self.encoder(x)          # [B,T,N,D]  (has grad to encoder and x)
+
+        # Use a detached copy for burn-in dynamics so we don't build a giant graph
+        z = z0.detach()
+        t = 0
+
+        # Burn-in with no grad (fast + memory-free)
+        if burn_periods > 0:
+            with torch.no_grad():
+                for _ in range(burn_periods):
+                    z = self.forward_cycle(z, t0=t, is_causal=is_causal)
+                    t += self.N
+
+        # Forward value becomes "z" (burned-in), but gradient flows back into z0
+        z = z.detach() + (z0 - z0.detach())
+
+        # Final periods with grad through recurrence (short unroll)
+        for _ in range(grad_cycles):
+            z = self.forward_cycle(z, t0=t, is_causal=is_causal)
+            t += self.N
 
         # Decoder converts [B, T, N, D] back to [B, T, io_dim]
         y = self.decoder(z)
-
         return y
 
 
