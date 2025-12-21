@@ -59,8 +59,10 @@ class StreamLoRAEncoder(nn.Module):
         self.enc_A = nn.Linear(input_dim, rank, bias=False)
 
         # [N, r, D] is nicer for bmm
-        self.enc_B = nn.Parameter(torch.zeros(num_splits, rank, output_dim))
-        self.enc_beta = nn.Parameter(torch.tensor(0.0))
+        self.enc_B = nn.Parameter(torch.zeros(rank, num_splits, output_dim))
+
+        # start near-off but not exactly 0 (for gradient flow)
+        self.enc_beta = nn.Parameter(torch.tensor(0.01))
 
         self.reset_parameters()
 
@@ -69,13 +71,7 @@ class StreamLoRAEncoder(nn.Module):
         nn.init.xavier_uniform_(self.enc_A.weight)
         nn.init.zeros_(self.enc_B)
         with torch.no_grad():
-            self.enc_beta.fill_(0.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base = self.enc_base(x)                 # [B,T,Dout]
-        h = self.enc_A(x)                       # [B,T,r]
-        delta = torch.einsum("b t r, r n d -> b t n d", h, self.enc_B)  # [B,T,N,Dout]
-        return base.unsqueeze(2) + self.enc_beta * delta               # [B,T,N,Dout]
+            self.enc_beta.fill_(0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -204,7 +200,7 @@ class Morpher(nn.Module):
         self.decoder = StreamLoRADecoder(self.N, self.D, io_dim, enc_dec_rank)
 
         # Mixer
-        self.mixer_hidden_dim = mixer_hidden_dim if mixer_hidden_dim is not None else 4 *self.D
+        self.mixer_hidden_dim = mixer_hidden_dim if mixer_hidden_dim is not None else 4 * self.D
         self.ln_mixer = nn.LayerNorm(self.D)
         self.mixer = nn.Sequential(
             nn.Linear(self.D, self.mixer_hidden_dim),
@@ -228,11 +224,8 @@ class Morpher(nn.Module):
         self._build_active_slots_table()
         self._build_permutation_tables()
 
-        self.reset_parameters()
 
     def reset_parameters(self):
-        """Reset all learnable parameters."""
-        # Initialize attention weights
         nn.init.xavier_uniform_(self.Wqkv.reshape(self.K * self.N, self.head_input_dim, 3 * self.d))
         self.encoder.reset_parameters()
         self.decoder.reset_parameters()
@@ -281,7 +274,7 @@ class Morpher(nn.Module):
     # -----------------------------
     def _project_qkv_slot_vectorized(self, x_slot: torch.Tensor, phase: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        SLOT fast path (best when head_input_dim=d):
+        SLOT fast path (best when in_dim=d):
           x_slot: [B,T,N,K,d] after LN
         Returns:
           q,k,v: [B, N*K, T, d]
@@ -334,7 +327,6 @@ class Morpher(nn.Module):
         k = k_stream.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
         v = v_stream.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
         return q, k, v
-
 
     def _project_qkv_big_per_scale(self, x_in: torch.Tensor, phase: int):
         """
@@ -393,6 +385,7 @@ class Morpher(nn.Module):
         k = torch.stack(k_list, dim=2).reshape(B, N * K, T, d)
         v = torch.stack(v_list, dim=2).reshape(B, N * K, T, d)
         return q, k, v
+
 
 
     # -----------------------------
@@ -469,7 +462,7 @@ class Morpher(nn.Module):
         z = z0.detach()
         t = 0
         if burn_cycles > 0:
-            with torch.inference_mode(): # usually faster than torch.no_grad()
+            with torch.inference_mode():
                 for _ in range(burn_cycles):
                     z = self.forward_cycle(z, t0=t, is_causal=is_causal)
                     t += self.N
