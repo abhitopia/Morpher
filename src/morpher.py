@@ -59,8 +59,8 @@ class StreamLoRAEncoder(nn.Module):
         self.enc_A = nn.Linear(input_dim, rank, bias=False)
 
         # [N, r, D] is nicer for bmm
-        self.enc_B = nn.Parameter(torch.zeros(rank, num_splits, output_dim))
-
+        self.enc_B = nn.Parameter(torch.zeros(num_splits, rank, output_dim))  # [N, r, D]
+        
         # start near-off but not exactly 0 (for gradient flow)
         self.enc_beta = nn.Parameter(torch.tensor(0.01))
 
@@ -221,14 +221,25 @@ class Morpher(nn.Module):
         # Fused Wqkv: [K, N, in_dim, 3d]
         self.Wqkv = nn.Parameter(torch.empty(self.K, self.N, self.head_input_dim, 3 * self.d))
 
+        # If SHARED, vectorizing across K requires materializing x_head = [B,T,K,N,in_dim].
+        # We only do that if it stays under this budget.
+        self.max_shared_xhead_bytes = 128 * 1024 * 1024  # 128MB default (safe for most cases)
+
         self._build_active_slots_table()
         self._build_permutation_tables()
+        self.reset_parameters()
 
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.Wqkv.reshape(self.K * self.N, self.head_input_dim, 3 * self.d))
         self.encoder.reset_parameters()
         self.decoder.reset_parameters()
+
+        for m in self.mixer:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     # -----------------------------
     # Tables
@@ -272,6 +283,42 @@ class Morpher(nn.Module):
     # -----------------------------
     # QKV projection helpers
     # -----------------------------
+    def _project_qkv_slot(self, x_head: torch.Tensor, B: int, T: int, N: int, K: int, d: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Common QKV projection logic for both PRIVATE and SHARED wiring.
+        x_head: [B,T,K,N,d] in head order
+        Returns: q_head, k_head, v_head: [B,T,K,N,d] in head order
+        """
+
+        assert self.head_input_dim == d, f"Common SLOT projector assumes in_dim == d, got {self.head_input_dim} != {d}"
+
+        # Pack (K*N) heads as batch for bmm
+        x_h = x_head.permute(2, 3, 0, 1, 4).reshape(K * N, B * T, d)        # [K*N, BT, d]
+        w = self.Wqkv.reshape(K * N, d, 3 * d)                              # [K*N, d, 3d]
+        qkv_h = torch.bmm(x_h, w)                                           # [K*N, BT, 3d]
+        qkv = qkv_h.reshape(K, N, B, T, 3 * d).permute(2, 3, 0, 1, 4)       # [B,T,K,N,3d] head order
+        q_head, k_head, v_head = qkv.split(d, dim=-1)                       # [B,T,K,N,d] head order
+        return q_head, k_head, v_head
+
+
+    def _pack_qkv_for_sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, B: int, T: int, N: int, K: int, d: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Expect either [B,T,K,N,d] OR [B,N,K,T,d]
+        if q.shape == (B, T, K, N, d):
+            q_out = q.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
+            k_out = k.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
+            v_out = v.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
+            return q_out, k_out, v_out
+
+        if q.shape == (B, N, K, T, d):
+            # This is already [B,N,K,T,d] so just reshape
+            q_out = q.reshape(B, N * K, T, d)
+            k_out = k.reshape(B, N * K, T, d)
+            v_out = v.reshape(B, N * K, T, d)
+            return q_out, k_out, v_out
+
+        raise ValueError(f"Unexpected q shape {tuple(q.shape)} (expected {(B,T,K,N,d)} or {(B,N,K,T,d)})")
+
+
     def _project_qkv_slot_vectorized(self, x_slot: torch.Tensor, phase: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         SLOT fast path (best when in_dim=d):
@@ -289,17 +336,8 @@ class Morpher(nn.Module):
             # Identity wiring: no permutations needed.
             # Head order == stream order.
             x_head = x_in  # [B,T,K,N,d]
-            # Pack (K*N) heads as batch for bmm
-            x_h = x_head.permute(2, 3, 0, 1, 4).reshape(K * N, B * T, d)          # [K*N, BT, d]
-            w = self.Wqkv.reshape(K * N, d, 3 * d)                                # [K*N, d, 3d]
-            qkv_h = torch.bmm(x_h, w)                                             # [K*N, BT, 3d]
-            qkv = qkv_h.reshape(K, N, B, T, 3 * d).permute(2, 3, 0, 1, 4)         # [B,T,K,N,3d]
-            q, k, v = qkv.split(d, dim=-1)                                        # each [B,T,K,N,d]
-            # Pack to SDPA head axis: [B,T,K,N,d] -> [B,N,K,T,d] -> [B,N*K,T,d]
-            q = q.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-            k = k.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-            v = v.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-            return q, k, v
+            q_head, k_head, v_head = self._project_qkv_slot(x_head, B, T, N, K, d)
+            return self._pack_qkv_for_sdpa(q_head, k_head, v_head, B, T, N, K, d)
 
         # SHARED wiring: permute streams -> heads and back
         p = self.perm_within_scale[phase]      # [K,N] stream->head
@@ -310,11 +348,7 @@ class Morpher(nn.Module):
         x_head = torch.gather(x_in, dim=3, index=inv_idx)  # [B,T,K,N,d] head order
 
         # Project all (K*N) heads in one batched GEMM
-        x_h = x_head.permute(2, 3, 0, 1, 4).reshape(K * N, B * T, d)        # [K*N, BT, d]
-        w = self.Wqkv.reshape(K * N, d, 3 * d)                              # [K*N, d, 3d]
-        qkv_h = torch.bmm(x_h, w)                                           # [K*N, BT, 3d]
-        qkv = qkv_h.reshape(K, N, B, T, 3 * d).permute(2, 3, 0, 1, 4)       # [B,T,K,N,3d] head order
-        q_head, k_head, v_head = qkv.split(d, dim=-1)                       # [B,T,K,N,d] head order
+        q_head, k_head, v_head = self._project_qkv_slot(x_head, B, T, N, K, d)
 
         # Route HEAD->STREAM: for each stream position s choose head p[k,s]
         p_idx = p.view(1, 1, K, N, 1).expand(B, T, K, N, d)
@@ -322,70 +356,95 @@ class Morpher(nn.Module):
         k_stream = torch.gather(k_head, dim=3, index=p_idx)
         v_stream = torch.gather(v_head, dim=3, index=p_idx)
 
-        # Pack to SDPA: [B,T,K,N,d] -> [B,N,K,T,d] -> [B,N*K,T,d]
-        q = q_stream.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-        k = k_stream.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-        v = v_stream.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-        return q, k, v
+        # Pack to SDPA format
+        return self._pack_qkv_for_sdpa(q_stream, k_stream, v_stream, B, T, N, K, d)
+
 
     def _project_qkv_big_per_scale(self, x_in: torch.Tensor, phase: int):
         """
         STREAM/SCALES path:
         x_in: [B,T,N,in_dim] (LN already applied)
-
         Returns:
         q,k,v: [B, N*K, T, d]
 
         Strategy:
-        - PRIVATE: vectorize across K with a single einsum (no permutations needed, no Kx input replication)
-        - SHARED : keep per-scale loop to avoid materializing [B,T,K,N,in_dim] (which is huge for STREAM)
+        - PRIVATE: vectorize across K via einsum (no Kx input materialization)
+        - SHARED:
+            * if Kx materialization is small enough: vectorize across K with one batched bmm
+            * else: per-scale loop (memory-safe, best for large STREAM dims)
         """
         B, T, N, in_dim = x_in.shape
         assert N == self.N and in_dim == self.head_input_dim
-
         d = self.d
         K = self.K
 
+        # ---------- PRIVATE: fully vectorized, no Kx input materialization ----------
         if self.stream_head_assignment == StreamHeadAssignment.PRIVATE:
-            # Vectorized: qkv [B,T,K,N,3d]
-            # No permutations, so this avoids the K-loop without replicating x_in.
-            qkv = torch.einsum("b t n i, k n i o -> b t k n o", x_in, self.Wqkv)  # [B,T,K,N,3d]
+            # qkv: [B,T,K,N,3d]
+            qkv = torch.einsum("b t n i, k n i o -> b t k n o", x_in, self.Wqkv)
             q, k, v = qkv.split(d, dim=-1)  # each [B,T,K,N,d]
+            return self._pack_qkv_for_sdpa(q, k, v, B, T, N, K, d)
 
-            # Pack to SDPA format: [B,T,K,N,d] -> [B,N,K,T,d] -> [B,N*K,T,d]
-            q = q.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-            k = k.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-            v = v.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-            return q, k, v
+        # ---------- SHARED: auto-select vectorized vs loop ----------
+        # Vectorized SHARED needs x_head of shape [B,T,K,N,in_dim] (head order),
+        # which is x_in.numel() * K elements.
+        bytes_x_head = x_in.numel() * K * x_in.element_size()
+        can_vectorize = bytes_x_head <= self.max_shared_xhead_bytes
 
-        # SHARED: keep the loop to avoid Kx input materialization.
+        if can_vectorize:
+            # Build x_broadcast: [B,T,K,N,in_dim] (stream order) as a view (expand is cheap)
+            x_b = x_in.unsqueeze(2).expand(B, T, K, N, in_dim)
+
+            inv = self.invperm_within_scale[phase]  # [K,N] head->stream
+            inv_idx = inv.view(1, 1, K, N, 1).expand(B, T, K, N, in_dim)
+
+            # Reorder streams -> head order for all scales at once
+            x_head = torch.gather(x_b, dim=3, index=inv_idx)  # [B,T,K,N,in_dim] head order
+
+            # Project all K*N heads in one batched bmm
+            x_h = x_head.permute(2, 3, 0, 1, 4).reshape(K * N, B * T, in_dim)   # [K*N, BT, in]
+            w = self.Wqkv.reshape(K * N, in_dim, 3 * d)                          # [K*N, in, 3d]
+            qkv_h = torch.bmm(x_h, w)                                            # [K*N, BT, 3d]
+            qkv = qkv_h.reshape(K, N, B, T, 3 * d).permute(2, 3, 0, 1, 4)        # [B,T,K,N,3d] head order
+            q_head, k_head, v_head = qkv.split(d, dim=-1)                        # [B,T,K,N,d] head order
+
+            # Route head -> stream: for each stream position s choose head p[k,s]
+            p = self.perm_within_scale[phase]  # [K,N] stream->head
+            p_idx = p.view(1, 1, K, N, 1).expand(B, T, K, N, d)
+
+            q_stream = torch.gather(q_head, dim=3, index=p_idx)  # [B,T,K,N,d] (dim=3 now stream)
+            k_stream = torch.gather(k_head, dim=3, index=p_idx)
+            v_stream = torch.gather(v_head, dim=3, index=p_idx)
+
+            return self._pack_qkv_for_sdpa(q_stream, k_stream, v_stream, B, T, N, K, d)
+
+        # ---------- SHARED fallback: per-scale loop (memory-safe) ----------
         q_list, k_list, v_list = [], [], []
         for k_idx in range(K):
-            inv = self.invperm_within_scale[phase, k_idx]  # [N] head->stream
-            x_head = x_in.index_select(dim=2, index=inv)   # [B,T,N,in_dim] head order
+            inv_k = self.invperm_within_scale[phase, k_idx]  # [N] head->stream
+            x_head_k = x_in.index_select(dim=2, index=inv_k)  # [B,T,N,in_dim] head order
 
             # bmm across heads=N
-            x_h = x_head.permute(2, 0, 1, 3).reshape(N, B * T, in_dim)      # [N, BT, in]
-            w = self.Wqkv[k_idx]                                            # [N, in, 3d]
-            qkv_h = torch.bmm(x_h, w)                                       # [N, BT, 3d]
-            qkv = qkv_h.reshape(N, B, T, 3 * d).permute(1, 2, 0, 3)         # [B,T,N,3d] head order
-            q_head, k_head, v_head = qkv.split(d, dim=-1)                   # each [B,T,N,d] head order
+            x_h = x_head_k.permute(2, 0, 1, 3).reshape(N, B * T, in_dim)        # [N, BT, in]
+            w_k = self.Wqkv[k_idx]                                              # [N, in, 3d]
+            qkv_h = torch.bmm(x_h, w_k)                                         # [N, BT, 3d]
+            qkv = qkv_h.reshape(N, B, T, 3 * d).permute(1, 2, 0, 3)             # [B,T,N,3d] head order
+            q_head, k_head, v_head = qkv.split(d, dim=-1)                        # [B,T,N,d] head order
 
             # Route back to stream order
-            p = self.perm_within_scale[phase, k_idx]                        # [N] stream->head
-            q_stream = q_head.index_select(dim=2, index=p)
-            k_stream = k_head.index_select(dim=2, index=p)
-            v_stream = v_head.index_select(dim=2, index=p)
+            p_k = self.perm_within_scale[phase, k_idx]                          # [N] stream->head
+            q_stream = q_head.index_select(dim=2, index=p_k)
+            k_stream = k_head.index_select(dim=2, index=p_k)
+            v_stream = v_head.index_select(dim=2, index=p_k)
 
             q_list.append(q_stream.permute(0, 2, 1, 3))  # [B,N,T,d]
             k_list.append(k_stream.permute(0, 2, 1, 3))
             v_list.append(v_stream.permute(0, 2, 1, 3))
 
-        q = torch.stack(q_list, dim=2).reshape(B, N * K, T, d)
-        k = torch.stack(k_list, dim=2).reshape(B, N * K, T, d)
-        v = torch.stack(v_list, dim=2).reshape(B, N * K, T, d)
-        return q, k, v
-
+        q_stacked = torch.stack(q_list, dim=2)  # [B,N,K,T,d]
+        k_stacked = torch.stack(k_list, dim=2)
+        v_stacked = torch.stack(v_list, dim=2)
+        return self._pack_qkv_for_sdpa(q_stacked, k_stacked, v_stacked, B, T, N, K, d)
 
 
     # -----------------------------
