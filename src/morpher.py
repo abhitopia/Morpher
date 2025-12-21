@@ -165,6 +165,11 @@ class HeadInputScope(StrEnum):
 # Morpher
 # -----------------------------
 class Morpher(nn.Module):
+    # Type annotations for registered buffers to help mypy
+    active_slots: torch.Tensor
+    perm_within_scale: torch.Tensor
+    invperm_within_scale: torch.Tensor
+
     def __init__(
         self,
         io_dim: int,
@@ -397,8 +402,8 @@ class Morpher(nn.Module):
             return self._pack_qkv_for_sdpa(q_head, k_head, v_head, B, T, N, K, d)
 
         # SHARED wiring: permute streams -> heads and back
-        p = self.perm_within_scale[phase]  # [K,N] stream->head
-        inv = self.invperm_within_scale[phase]  # [K,N] head->stream
+        p: torch.Tensor = self.perm_within_scale[phase]  # [K,N] stream->head
+        inv: torch.Tensor = self.invperm_within_scale[phase]  # [K,N] head->stream
 
         # gather streams into HEAD order along dim=3 (stream axis)
         inv_idx = inv.view(1, 1, K, N, 1).expand(B, T, K, N, d)
@@ -453,7 +458,7 @@ class Morpher(nn.Module):
             # Build x_broadcast: [B,T,K,N,in_dim] (stream order) as a view (expand is cheap)
             x_b = x_in.unsqueeze(2).expand(B, T, K, N, in_dim)
 
-            inv = self.invperm_within_scale[phase]  # [K,N] head->stream
+            inv: torch.Tensor = self.invperm_within_scale[phase]  # [K,N] head->stream
             inv_idx = inv.view(1, 1, K, N, 1).expand(B, T, K, N, in_dim)
 
             # Reorder streams -> head order for all scales at once
@@ -473,7 +478,7 @@ class Morpher(nn.Module):
             q_head, k_head, v_head = qkv.split(d, dim=-1)  # [B,T,K,N,d] head order
 
             # Route head -> stream: for each stream position s choose head p[k,s]
-            p = self.perm_within_scale[phase]  # [K,N] stream->head
+            p: torch.Tensor = self.perm_within_scale[phase]  # [K,N] stream->head
             p_idx = p.view(1, 1, K, N, 1).expand(B, T, K, N, d)
 
             q_stream = torch.gather(
@@ -487,7 +492,7 @@ class Morpher(nn.Module):
         # ---------- SHARED fallback: per-scale loop (memory-safe) ----------
         q_list, k_list, v_list = [], [], []
         for k_idx in range(K):
-            inv_k = self.invperm_within_scale[phase, k_idx]  # [N] head->stream
+            inv_k: torch.Tensor = self.invperm_within_scale[phase, k_idx]  # [N] head->stream
             x_head_k = x_in.index_select(
                 dim=2, index=inv_k
             )  # [B,T,N,in_dim] head order
@@ -502,7 +507,7 @@ class Morpher(nn.Module):
             q_head, k_head, v_head = qkv.split(d, dim=-1)  # [B,T,N,d] head order
 
             # Route back to stream order
-            p_k = self.perm_within_scale[phase, k_idx]  # [N] stream->head
+            p_k: torch.Tensor = self.perm_within_scale[phase, k_idx]  # [N] stream->head
             q_stream = q_head.index_select(dim=2, index=p_k)
             k_stream = k_head.index_select(dim=2, index=p_k)
             v_stream = v_head.index_select(dim=2, index=p_k)
@@ -527,7 +532,7 @@ class Morpher(nn.Module):
         assert N == self.N and D == self.D
 
         phase = t % self.N
-        active_slots = self.active_slots[phase]  # [K]
+        active_slots: torch.Tensor = self.active_slots[phase]  # [K]
 
         # Mixer
         z_head = z + self.dropout_mixer(self.mixer(self.ln_mixer(z)))  # [B,T,N,D]
