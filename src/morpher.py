@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils import NoParamRMSNorm
+
 
 # -----------------------------
 # Utilities
@@ -125,7 +127,7 @@ class StreamLoRADecoder(nn.Module):
         self.rank = rank
 
         in_dim = self.N * self.input_dim
-        self.ln = nn.LayerNorm(in_dim) if use_layernorm else nn.Identity()
+        self.ln = NoParamRMSNorm(in_dim) if use_layernorm else nn.Identity()
         self.proj_down = nn.Linear(in_dim, rank, bias=bias)
         self.proj_up = nn.Linear(rank, output_dim, bias=bias)
 
@@ -220,7 +222,7 @@ class Morpher(nn.Module):
         self.mixer_hidden_dim = (
             mixer_hidden_dim if mixer_hidden_dim is not None else 4 * self.D
         )
-        self.ln_mixer = nn.LayerNorm(self.D)
+        self.ln_mixer = NoParamRMSNorm(self.D)
         self.mixer = nn.Sequential(
             nn.Linear(self.D, self.mixer_hidden_dim),
             nn.GELU(),
@@ -235,7 +237,7 @@ class Morpher(nn.Module):
         else:
             self.head_input_dim = self.D
 
-        self.ln_attn = nn.LayerNorm(self.head_input_dim)
+        self.ln_attn = NoParamRMSNorm(self.head_input_dim)
 
         # Fused Wqkv: [K, N, in_dim, 3d]
         self.Wqkv = nn.Parameter(
