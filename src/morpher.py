@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import NoParamRMSNorm
+from utils import NoParamRMSNorm, CastedLinear
 
 
 # -----------------------------
@@ -60,8 +60,8 @@ class StreamLoRAEncoder(nn.Module):
         self.N = num_splits
         self.rank = rank
 
-        self.enc_base = nn.Linear(input_dim, output_dim, bias=False)
-        self.enc_A = nn.Linear(input_dim, rank, bias=False)
+        self.enc_base = CastedLinear(input_dim, output_dim, bias=False)
+        self.enc_A = CastedLinear(input_dim, rank, bias=False)
 
         # [N, r, D] is nicer for bmm
         self.enc_B = nn.Parameter(
@@ -128,8 +128,8 @@ class StreamLoRADecoder(nn.Module):
 
         in_dim = self.N * self.input_dim
         self.ln = NoParamRMSNorm(in_dim) if use_layernorm else nn.Identity()
-        self.proj_down = nn.Linear(in_dim, rank, bias=bias)
-        self.proj_up = nn.Linear(rank, output_dim, bias=bias)
+        self.proj_down = CastedLinear(in_dim, rank, bias=bias)
+        self.proj_up = CastedLinear(rank, output_dim, bias=bias)
 
         self.reset_parameters()
 
@@ -224,9 +224,9 @@ class Morpher(nn.Module):
         )
         self.ln_mixer = NoParamRMSNorm(self.D)
         self.mixer = nn.Sequential(
-            nn.Linear(self.D, self.mixer_hidden_dim),
+            CastedLinear(self.D, self.mixer_hidden_dim),
             nn.GELU(),
-            nn.Linear(self.mixer_hidden_dim, self.D),
+            CastedLinear(self.mixer_hidden_dim, self.D),
         )
 
         # Attention input dims per scope
