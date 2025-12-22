@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import NoParamRMSNorm, CastedLinear, trunc_normal_init_
+from utils import NoParamRMSNorm, CastedLinear, SwiGLU, trunc_normal_init_
 
 
 # -----------------------------
@@ -174,7 +174,7 @@ class Morpher(nn.Module):
         d: int,
         time_scales: List[int],
         enc_dec_rank: int,
-        mixer_hidden_dim: int | None = None,
+        mixer_expansion: float = 4.0,
         stream_head_assignment: StreamHeadAssignment = StreamHeadAssignment.SHARED,
         head_input_scope: HeadInputScope = HeadInputScope.SLOT,
         dropout: float = 0.0,
@@ -215,15 +215,9 @@ class Morpher(nn.Module):
         self.decoder = StreamLoRADecoder(self.N, self.D, io_dim, enc_dec_rank)
 
         # Mixer
-        self.mixer_hidden_dim = (
-            mixer_hidden_dim if mixer_hidden_dim is not None else 4 * self.D
-        )
+        self.mixer_expansion = mixer_expansion
         self.ln_mixer = NoParamRMSNorm(self.D)
-        self.mixer = nn.Sequential(
-            CastedLinear(self.D, self.mixer_hidden_dim),
-            nn.GELU(),
-            CastedLinear(self.mixer_hidden_dim, self.D),
-        )
+        self.mixer = SwiGLU(self.D, self.mixer_expansion)
 
         # Attention input dims per scope
         if self.head_input_scope == HeadInputScope.SLOT:
@@ -256,11 +250,7 @@ class Morpher(nn.Module):
         trunc_normal_init_(wqkv_flat, std=1.0 / (self.head_input_dim ** 0.5))
         self.encoder.reset_parameters()
         self.decoder.reset_parameters()
-
-        # Mixer layers are CastedLinear and use trunc_normal_init_ in their reset_parameters
-        for m in self.mixer:
-            if isinstance(m, CastedLinear):
-                m.reset_parameters()
+        self.mixer.reset_parameters()
 
     # -----------------------------
     # Tables
@@ -624,7 +614,7 @@ if __name__ == "__main__":
     B, T, io_dim = 4, 10, 16
     time_scales = [1, 2, 4]
     d = 12
-    mixer_dim = 72
+    mixer_expansion = 4.0  # Expansion factor for SwiGLU
     enc_dec_rank = 8
 
     model = Morpher(
@@ -632,7 +622,7 @@ if __name__ == "__main__":
         d=d,
         time_scales=time_scales,
         enc_dec_rank=enc_dec_rank,
-        mixer_hidden_dim=mixer_dim,
+        mixer_expansion=mixer_expansion,
         stream_head_assignment=StreamHeadAssignment.PRIVATE,
         head_input_scope=HeadInputScope.SLOT,  # try STREAM / SCALES too
         dropout=0.1,
