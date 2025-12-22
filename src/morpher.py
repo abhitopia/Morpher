@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import NoParamRMSNorm, CastedLinear
+from utils import NoParamRMSNorm, CastedLinear, trunc_normal_init_
 
 
 # -----------------------------
@@ -74,8 +74,8 @@ class StreamLoRAEncoder(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.xavier_uniform_(self.enc_base.weight)
-        nn.init.xavier_uniform_(self.enc_A.weight)
+        self.enc_base.reset_parameters()  # CastedLinear uses trunc_normal_init_
+        self.enc_A.reset_parameters()     # CastedLinear uses trunc_normal_init_
         nn.init.zeros_(self.enc_B)
         with torch.no_grad():
             self.enc_beta.fill_(0.01)
@@ -134,12 +134,8 @@ class StreamLoRADecoder(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.xavier_uniform_(self.proj_down.weight)
-        nn.init.xavier_uniform_(self.proj_up.weight)
-        if self.proj_down.bias is not None:
-            nn.init.zeros_(self.proj_down.bias)
-        if self.proj_up.bias is not None:
-            nn.init.zeros_(self.proj_up.bias)
+        self.proj_down.reset_parameters()  # CastedLinear uses trunc_normal_init_
+        self.proj_up.reset_parameters()    # CastedLinear uses trunc_normal_init_
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         B, T, N, D = z.shape
@@ -255,17 +251,16 @@ class Morpher(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.xavier_uniform_(
-            self.Wqkv.reshape(self.K * self.N, self.head_input_dim, 3 * self.d)
-        )
+        # Initialize Wqkv with truncated normal (matches HRM's approach)
+        wqkv_flat = self.Wqkv.view(-1, self.head_input_dim, 3 * self.d)
+        trunc_normal_init_(wqkv_flat, std=1.0 / (self.head_input_dim ** 0.5))
         self.encoder.reset_parameters()
         self.decoder.reset_parameters()
 
+        # Mixer layers are CastedLinear and use trunc_normal_init_ in their reset_parameters
         for m in self.mixer:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+            if isinstance(m, CastedLinear):
+                m.reset_parameters()
 
     # -----------------------------
     # Tables

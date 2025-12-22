@@ -44,14 +44,16 @@ class CastedLinear(nn.Module):
                  out_features: int,
                  bias: bool):
         super().__init__()
-        # Truncated LeCun normal init
-        self.weight = nn.Parameter(
-            trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5))
-        )
+        self.weight = nn.Parameter(torch.empty((out_features, in_features)))
         self.bias = None
         if bias:
-            # Zero init bias
-            self.bias = nn.Parameter(torch.zeros((out_features, )))
+            self.bias = nn.Parameter(torch.empty((out_features, )))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        trunc_normal_init_(self.weight, std=1.0 / (self.weight.shape[1] ** 0.5))
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         # HRM's approach: explicit casting for mixed precision compatibility
