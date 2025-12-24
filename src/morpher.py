@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from utils import (
     NoParamRMSNorm, CastedLinear, SwiGLU, trunc_normal_init_, Dropout, lcm_list,
-    RotaryEmbedding, apply_rotary_pos_emb,
+    RotaryEmbedding, apply_rotary_pos_emb
 )
 
 
@@ -478,10 +478,10 @@ class AttentionAdapter(nn.Module):
       head_index = k * N + n    (scale-major head order)
     """
 
-    def __init__(self, backend: AttnBackend):
+    def __init__(self, backend: AttnBackend, rope: RotaryEmbedding | None = None):
         super().__init__()
         self.backend = backend
-
+        self.rope = rope
         self._flash_attn_func = None
         self._flash_qkvpacked_func = None
 
@@ -507,9 +507,7 @@ class AttentionAdapter(nn.Module):
         *,
         is_causal: bool,
         dropout_p: float,
-        # RoPE (optional): both are [T, d], already sliced to the current sequence length
-        cos: torch.Tensor | None = None,
-        sin: torch.Tensor | None = None,
+        pos_offset: int = 0,
     ) -> torch.Tensor:
         B, T, K, N, three_d = qkv_btk_n3d.shape
         assert three_d % 3 == 0
@@ -532,9 +530,11 @@ class AttentionAdapter(nn.Module):
         # apply_rotary_pos_emb expects:
         #   q,k: [B, T, H, d]
         #   cos,sin: [T, d]
-        if cos is not None:
-            # sin should be present too; keep a hard assert to catch wiring mistakes.
-            assert sin is not None
+        if self.rope is not None:
+            cos_full, sin_full = self.rope()  # each [max_pos, d]
+            # slice positions [pos_offset : pos_offset + T]
+            cos = cos_full[pos_offset : pos_offset + T]
+            sin = sin_full[pos_offset : pos_offset + T]
             q_bthd, k_bthd = apply_rotary_pos_emb(q_bthd, k_bthd, cos, sin)
 
         if self.backend == AttnBackend.SDPA:
@@ -617,9 +617,6 @@ class Morpher(nn.Module):
 
         # d = slot feature width
         self.d = d
-        if use_rope:
-            assert self.d % 2 == 0, "RoPE requires even head_dim (d)"
-
         # N = number of streams (also the phase period)
         self.N = lcm_list(self.time_scales)
 
@@ -664,13 +661,11 @@ class Morpher(nn.Module):
             max_shared_xhead_bytes=128 * 1024 * 1024,
         )
 
-        # Attention backend adapter
-        self.attn = AttentionAdapter(attn_backend)
-
         # --- Rotary positional embedding (RoPE) ---
         self.use_rope = bool(use_rope)
         self.rope = None
         if self.use_rope:
+            assert self.d % 2 == 0, "RoPE requires even head_dim (d)"
             # Cached cos/sin buffers sized to max_position_embeddings.
             self.rope = RotaryEmbedding(
                 dim=self.d,
@@ -678,6 +673,8 @@ class Morpher(nn.Module):
                 base=int(rope_base),
             )
 
+        # Attention backend adapter
+        self.attn = AttentionAdapter(attn_backend, rope=self.rope)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -752,23 +749,7 @@ class Morpher(nn.Module):
             )
 
         # ---- 4) Attention over streams/scales
-        # RoPE cos/sin: [T, d] (slice from cached buffers)
-        cos = sin = None
-        if self.use_rope:
-            assert self.rope is not None
-            cos_full, sin_full = self.rope()          # [max_pos, d]
-            # NOTE: this applies RoPE based on absolute token index 0..T-1.
-            # If you want micro-step-dependent offset, slice with (t_offset:t_offset+T) instead.
-            cos = cos_full[:T]
-            sin = sin_full[:T]
-
-        out_btknd = self.attn(
-            qkv_btk_n3d,
-            is_causal=is_causal,
-            dropout_p=self.dropout_p,
-            cos=cos,
-            sin=sin,
-        )  # [B, T, K, N, d]
+        out_btknd = self.attn(qkv_btk_n3d, is_causal=is_causal, dropout_p=self.dropout_p, pos_offset=0)
         out_btknd = self.dropout_attn(out_btknd)
 
         # Residual on active slots
