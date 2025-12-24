@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import List, Tuple
 from enum import StrEnum
+from typing import List, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,13 +10,74 @@ import torch.nn.functional as F
 from utils import NoParamRMSNorm, CastedLinear, SwiGLU, trunc_normal_init_, Dropout, lcm_list
 
 
-# -----------------------------
+"""
+================================================================================
+Morpher (refactored)
+================================================================================
+
+High-level idea
+---------------
+We maintain N parallel "streams" of state. Each stream contains S "slots" and each
+slot has width d, so the per-stream state width is:
+    D = S * d
+
+At each micro-step t we:
+  1) Mix each stream's full state (per-stream MLP).
+  2) Select K active slots per stream, where K = len(time_scales) and each scale
+     activates exactly one slot at that micro-step.
+  3) Build QKV for attention over streams (and scales), run attention, then write
+     the attention outputs back only into the active slots.
+
+Shape conventions
+-----------------
+We use a suffix naming convention to make tensor layouts obvious. Letters:
+  b: batch (B)
+  t: time  (T)
+  n: stream id (N = lcm(time_scales))
+  k: scale index (K = len(time_scales))
+  s: slot index (S = sum(time_scales))
+  d: per-slot dim (d)
+  D: per-stream dim (D = S*d)
+  i: generic projection input dim
+  o: generic projection output dim
+
+Core state:
+  z_btnd : [B, T, N, D]
+
+Slot view:
+  z_btnsd: [B, T, N, S, d]
+
+Active slots (selected from slot view):
+  z_active_btnkd: [B, T, N, K, d]
+
+Attention/QKV pipeline (chosen to be consistent at boundaries):
+--------------------------------------------------------------
+Inside the attention pipeline we use SCALE-MAJOR layout:
+  ..._btknd : [B, T, K, N, d]     (N is still "stream order" for outputs/heads)
+  qkv_btk_n3d: [B, T, K, N, 3d]
+
+This makes projector <-> attention adapter boundaries consistent:
+  projector(...) -> qkv_btk_n3d
+  attn(qkv_btk_n3d) -> out_btknd
+"""
+
+
+# =============================================================================
 # Stream LoRA Encoder / Decoder
-# -----------------------------
+# =============================================================================
 class StreamLoRAEncoder(nn.Module):
     """
-    x:  [B, T, input_dim]
-    z0: [B, T, N, output_dim]
+    Encode input x into an initial multi-stream state z0.
+
+    Input:
+      x_bti : [B, T, input_dim]
+
+    Output:
+      z0_btnd : [B, T, N, output_dim]
+
+    Structure:
+      base(x) is shared across streams
+      delta(x) is stream-specific LoRA (A shared, B per-stream)
     """
 
     def __init__(self, input_dim: int, output_dim: int, num_splits: int, rank: int):
@@ -25,55 +87,51 @@ class StreamLoRAEncoder(nn.Module):
         self.N = num_splits
         self.rank = rank
 
-        self.enc_base = CastedLinear(input_dim, output_dim, bias=False)
-        self.enc_A = CastedLinear(input_dim, rank, bias=False)
+        self.enc_base = CastedLinear(input_dim, output_dim, bias=False)  # shared
+        self.enc_A = CastedLinear(input_dim, rank, bias=False)          # shared
 
-        # [N, r, D] is nicer for bmm
-        self.enc_B = nn.Parameter(
-            torch.zeros(num_splits, rank, output_dim)
-        )  # [N, r, D]
+        # Per-stream LoRA B: [N, r, D]
+        self.enc_B = nn.Parameter(torch.zeros(num_splits, rank, output_dim))
 
-        # start near-off but not exactly 0 (for gradient flow)
+        # A small scalar so delta starts "near off" but not exactly 0 for gradient flow
         self.enc_beta = nn.Parameter(torch.tensor(0.01))
 
         self.reset_parameters()
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
         self.enc_base.reset_parameters()  # CastedLinear uses trunc_normal_init_
         self.enc_A.reset_parameters()     # CastedLinear uses trunc_normal_init_
         nn.init.zeros_(self.enc_B)
         with torch.no_grad():
             self.enc_beta.fill_(0.01)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x:  [B,T,input_dim]
-        z0: [B,T,N,output_dim]
-        """
-        B, T, _ = x.shape
+    def forward(self, x_bti: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x_bti.shape
 
-        base = self.enc_base(x)  # [B,T,D]
-        h = self.enc_A(x)  # [B,T,r]
+        base_btd = self.enc_base(x_bti)   # [B, T, D]
+        h_btr = self.enc_A(x_bti)         # [B, T, r]
 
-        # Compute delta via batched GEMM:
-        #   For each stream n: delta[:,:,n,:] = h @ B_n
-        # Reshape h to [B*T, r], then expand to [N, B*T, r] without copying
-        h_bt = h.reshape(B * T, self.rank)  # [BT, r]
-        h_n = h_bt.unsqueeze(0).expand(self.N, B * T, self.rank)  # [N, BT, r]
+        # Compute delta for each stream via batched GEMM:
+        #   delta[:,:,n,:] = h @ B[n]
+        #
+        # Efficient grouping: bmm over N "batches"
+        h_bt_r = h_btr.reshape(B * T, self.rank)                        # [BT, r]
+        h_n_bt_r = h_bt_r.unsqueeze(0).expand(self.N, B * T, self.rank) # [N, BT, r]
+        delta_n_bt_d = torch.bmm(h_n_bt_r, self.enc_B)                  # [N, BT, D]
 
-        # enc_B: [N, r, D]
-        delta_n = torch.bmm(h_n, self.enc_B)  # [N, BT, D]
-        delta = delta_n.permute(1, 0, 2).reshape(
-            B, T, self.N, self.output_dim
-        )  # [B,T,N,D]
-
-        return base.unsqueeze(2) + self.enc_beta * delta
+        delta_btnd = delta_n_bt_d.permute(1, 0, 2).reshape(B, T, self.N, self.output_dim)
+        return base_btd.unsqueeze(2) + self.enc_beta * delta_btnd       # [B, T, N, D]
 
 
 class StreamLoRADecoder(nn.Module):
     """
-    z: [B, T, N, input_dim]
-    y: [B, T, output_dim]
+    Decode multi-stream state back to output.
+
+    Input:
+      z_btnd : [B, T, N, input_dim]
+
+    Output:
+      y_bto : [B, T, output_dim]
     """
 
     def __init__(
@@ -91,56 +149,73 @@ class StreamLoRADecoder(nn.Module):
         self.output_dim = output_dim
         self.rank = rank
 
-        in_dim = self.N * self.input_dim
-        self.ln = NoParamRMSNorm(in_dim) if use_layernorm else nn.Identity()
-        self.proj_down = CastedLinear(in_dim, rank, bias=bias)
+        flat_in = self.N * self.input_dim
+        self.ln = NoParamRMSNorm(flat_in) if use_layernorm else nn.Identity()
+        self.proj_down = CastedLinear(flat_in, rank, bias=bias)
         self.proj_up = CastedLinear(rank, output_dim, bias=bias)
 
         self.reset_parameters()
 
-    def reset_parameters(self):
-        self.proj_down.reset_parameters()  # CastedLinear uses trunc_normal_init_
-        self.proj_up.reset_parameters()    # CastedLinear uses trunc_normal_init_
+    def reset_parameters(self) -> None:
+        self.proj_down.reset_parameters()
+        self.proj_up.reset_parameters()
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        B, T, N, D = z.shape
+    def forward(self, z_btnd: torch.Tensor) -> torch.Tensor:
+        B, T, N, D = z_btnd.shape
         assert N == self.N and D == self.input_dim
-        cat = z.reshape(B, T, N * D)
-        h = self.proj_down(self.ln(cat))
-        return self.proj_up(h)
+
+        z_flat_bt_i = z_btnd.reshape(B, T, N * D)        # [B, T, N*D]
+        h_btr = self.proj_down(self.ln(z_flat_bt_i))     # [B, T, r]
+        return self.proj_up(h_btr)                       # [B, T, out_dim]
 
 
-# -----------------------------
+# =============================================================================
 # Enums
-# -----------------------------
+# =============================================================================
 class StreamHeadAssignment(StrEnum):
-    SHARED = "shared"  # phase-permuted within scale
-    PRIVATE = "private"  # per-stream head within scale (identity)
+    SHARED = "shared"   # phase-dependent stream<->head permutation within each scale
+    PRIVATE = "private" # stream == head (identity mapping)
 
 
 class HeadInputScope(StrEnum):
-    SLOT = "slot"
-    STREAM = "stream"
-    SCALES = "scales"
+    SLOT = "slot"       # each scale uses only its own active slot (dim=d)
+    STREAM = "stream"   # each scale uses full stream state (dim=D)
+    SCALES = "scales"   # each scale uses concat of active slots (dim=K*d)
+
 
 class AttnBackend(StrEnum):
     SDPA = "sdpa"
-    FLASH3 = "flash3"                    # flash_attn_func(q,k,v) with q,k,v [B,T,H,d]
+    FLASH3 = "flash3"                     # flash_attn_func(q,k,v) with q,k,v [B,T,H,d]
     FLASH3_QKVPACKED = "flash3_qkvpacked" # flash_attn_qkvpacked_func(qkv) with qkv [B,T,3,H,d]
+
 
 # =============================================================================
 # Phase tables (init-time only)
 # =============================================================================
 class PhaseTables(nn.Module):
     """
-    Owns all precomputed tables:
-      active_slots[phase, k] -> which slot index is active for scale k at phase
-      perm[phase, k, stream] -> head id used by that stream (stream->head)
-      invperm[phase, k, head] -> stream that should feed that head (head->stream)
+    Precomputed routing tables for all phases.
+
+    Let:
+      time_scales = [s0, s1, ..., s_{K-1}]
+      K = len(time_scales)
+      N = lcm(time_scales)
+
+    active_slots[phase, k] gives the slot index (0..S-1) that is active for scale k
+    at that phase.
+
+    stream_to_head[phase, k, stream] -> head
+    head_to_stream[phase, k, head]   -> stream
+
+    Notes:
+      - In PRIVATE assignment: stream_to_head is identity for all phases/scales.
+      - In SHARED assignment: stream_to_head is a phase-dependent cyclic shift that
+        depends on the scale period.
     """
+
     active_slots: torch.Tensor
-    perm: torch.Tensor
-    invperm: torch.Tensor
+    stream_to_head: torch.Tensor
+    head_to_stream: torch.Tensor
 
     def __init__(self, time_scales: List[int], assignment: StreamHeadAssignment):
         super().__init__()
@@ -152,84 +227,110 @@ class PhaseTables(nn.Module):
         self.N = lcm_list(time_scales)
 
         self.register_buffer("active_slots", self._build_active_slots(), persistent=False)
-        perm, inv = self._build_perms(assignment)
-        self.register_buffer("perm", perm, persistent=False)
-        self.register_buffer("invperm", inv, persistent=False)
+        s2h, h2s = self._build_stream_head_maps(assignment)
+        self.register_buffer("stream_to_head", s2h, persistent=False)
+        self.register_buffer("head_to_stream", h2s, persistent=False)
 
     def _build_active_slots(self) -> torch.Tensor:
-        active = torch.empty(self.N, self.K, dtype=torch.long)
-        for phase in range(self.N):
-            off = 0
-            for k, s in enumerate(self.time_scales):
-                active[phase, k] = off + (phase % s)
-                off += s
-        return active  # [N, K]
+        # Layout: [phase, k] -> slot index in [0, S)
+        active_pk = torch.empty(self.N, self.K, dtype=torch.long)
 
-    def _build_perms(self, assignment: StreamHeadAssignment) -> Tuple[torch.Tensor, torch.Tensor]:
-        perm = torch.empty(self.N, self.K, self.N, dtype=torch.long)
-        inv  = torch.empty(self.N, self.K, self.N, dtype=torch.long)
-        stream_ids = torch.arange(self.N, dtype=torch.long)
+        for phase in range(self.N):
+            offset = 0
+            for k, s in enumerate(self.time_scales):
+                active_pk[phase, k] = offset + (phase % s)
+                offset += s
+
+        return active_pk  # [Nphase, K]
+
+    def _build_stream_head_maps(
+        self, assignment: StreamHeadAssignment
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # stream_to_head: [phase, k, stream] -> head
+        # head_to_stream: [phase, k, head] -> stream
+        s2h_pkn = torch.empty(self.N, self.K, self.N, dtype=torch.long)
+        h2s_pkn = torch.empty(self.N, self.K, self.N, dtype=torch.long)
+        stream_ids_n = torch.arange(self.N, dtype=torch.long)
 
         for phase in range(self.N):
             for k, s in enumerate(self.time_scales):
                 if assignment == StreamHeadAssignment.PRIVATE:
-                    p = stream_ids
+                    s2h_n = stream_ids_n
                 else:
+                    # phase-dependent cyclic shift; alpha ensures period matches scale
                     alpha = self.N // s
                     j = phase % s
-                    p = (stream_ids + alpha * j) % self.N
+                    s2h_n = (stream_ids_n + alpha * j) % self.N  # [N]
 
-                perm[phase, k] = p
-                inv_p = torch.empty_like(p)
-                inv_p[p] = stream_ids
-                inv[phase, k] = inv_p
+                s2h_pkn[phase, k] = s2h_n
 
-        return perm, inv  # each [N, K, N]
+                h2s_n = torch.empty_like(s2h_n)
+                h2s_n[s2h_n] = stream_ids_n
+                h2s_pkn[phase, k] = h2s_n
+
+        return s2h_pkn, h2s_pkn
 
 
 # =============================================================================
-# QKV projection + routing (returns packed QKV once)
+# Routing + projection helpers (performance-critical)
 # =============================================================================
-def _streams_to_heads(x_btkni: torch.Tensor, inv_kn: torch.Tensor) -> torch.Tensor:
+def _route_streams_to_heads_btkni(x_stream_btkni: torch.Tensor, head_to_stream_kn: torch.Tensor) -> torch.Tensor:
     """
-    x_btkni: [B,T,K,N,in] in stream-order along N
-    inv_kn:  [K,N] head->stream
-    returns: [B,T,K,N,in] in head-order along N
+    Reorder N dimension from "stream order" -> "head order".
+
+    x_stream_btkni: [B, T, K, N, in]
+    head_to_stream_kn: [K, N] where head_to_stream_kn[k, head] = stream
+
+    returns x_head_btkni: [B, T, K, N, in] (N is now head order)
+    """
+    B, T, K, N, in_dim = x_stream_btkni.shape
+    idx = head_to_stream_kn.view(1, 1, K, N, 1).expand(B, T, K, N, in_dim)
+    return torch.gather(x_stream_btkni, dim=3, index=idx)
+
+
+def _route_heads_to_streams_btkni(x_head_btkni: torch.Tensor, stream_to_head_kn: torch.Tensor) -> torch.Tensor:
+    """
+    Reorder N dimension from "head order" -> "stream order".
+
+    x_head_btkni: [B, T, K, N, in]
+    stream_to_head_kn: [K, N] where stream_to_head_kn[k, stream] = head
+
+    returns x_stream_btkni: [B, T, K, N, in] (N is now stream order)
+    """
+    B, T, K, N, in_dim = x_head_btkni.shape
+    idx = stream_to_head_kn.view(1, 1, K, N, 1).expand(B, T, K, N, in_dim)
+    return torch.gather(x_head_btkni, dim=3, index=idx)
+
+
+def _project_bmm_btkni(x_btkni: torch.Tensor, w_knio: torch.Tensor) -> torch.Tensor:
+    """
+    Grouped projection implemented via batched bmm.
+
+    x_btkni: [B, T, K, N, in]
+    w_knio:  [K, N, in, out]   (out is typically 3*d)
+
+    returns y_btkno: [B, T, K, N, out]
     """
     B, T, K, N, in_dim = x_btkni.shape
-    idx = inv_kn.view(1, 1, K, N, 1).expand(B, T, K, N, in_dim)
-    return torch.gather(x_btkni, dim=3, index=idx)
+    x = x_btkni.permute(2, 3, 0, 1, 4).reshape(K * N, B * T, in_dim)  # [K*N, BT, in]
+    w = w_knio.reshape(K * N, in_dim, -1)                              # [K*N, in, out]
+    y = torch.bmm(x, w)                                                # [K*N, BT, out]
+    return y.reshape(K, N, B, T, -1).permute(2, 3, 0, 1, 4)            # [B, T, K, N, out]
 
 
-def _heads_to_streams(x_btkni: torch.Tensor, perm_kn: torch.Tensor) -> torch.Tensor:
-    """
-    x_btkni: [B,T,K,N,in] in head-order along N
-    perm_kn: [K,N] stream->head
-    returns: [B,T,K,N,in] in stream-order along N
-    """
-    B, T, K, N, in_dim = x_btkni.shape
-    idx = perm_kn.view(1, 1, K, N, 1).expand(B, T, K, N, in_dim)
-    return torch.gather(x_btkni, dim=3, index=idx)
-
-
-def _project_bmm(x_btkni: torch.Tensor, w_knio: torch.Tensor) -> torch.Tensor:
-    """
-    x: [B,T,K,N,in]
-    w: [K,N,in,3d]
-    -> qkv: [B,T,K,N,3d]
-    """
-    B, T, K, N, in_dim = x_btkni.shape
-    x = x_btkni.permute(2, 3, 0, 1, 4).reshape(K * N, B * T, in_dim)     # [K*N, BT, in]
-    w = w_knio.reshape(K * N, in_dim, -1)                                 # [K*N, in, 3d]
-    y = torch.bmm(x, w).reshape(K, N, B, T, -1).permute(2, 3, 0, 1, 4)    # [B,T,K,N,3d]
-    return y
-
-
+# =============================================================================
+# QKV projector (returns QKV in a single packed tensor)
+# =============================================================================
 class QKVProjector(nn.Module):
     """
-    Owns Wqkv and produces packed QKV in *stream order*:
-      qkv_stream: [B,T,K,N,3d]
+    Owns Wqkv and produces packed QKV in SCALE-MAJOR layout:
+
+      qkv_btk_n3d: [B, T, K, N, 3d]   (N is stream-order on output)
+
+    Internally, when StreamHeadAssignment.SHARED is used, we temporarily route
+    streams -> heads before applying Wqkv, then route back.
     """
+
     def __init__(
         self,
         *,
@@ -248,6 +349,7 @@ class QKVProjector(nn.Module):
         self.assignment = assignment
         self.max_shared_xhead_bytes = int(max_shared_xhead_bytes)
 
+        # [K, N, in_dim, 3d]
         self.Wqkv = nn.Parameter(torch.empty(K, N, in_dim, 3 * d))
 
     def reset_parameters(self) -> None:
@@ -256,111 +358,130 @@ class QKVProjector(nn.Module):
 
     def project_slot(
         self,
-        x_btnkd: torch.Tensor,  # [B,T,N,K,d] stream-order
+        x_btknd: torch.Tensor,  # [B, T, K, N, d] (stream-order along N)
         *,
         phase: int,
-        perm: torch.Tensor,     # [Nphase,K,N]
-        invperm: torch.Tensor,  # [Nphase,K,N]
+        stream_to_head: torch.Tensor,  # [Nphase, K, N]
+        head_to_stream: torch.Tensor,  # [Nphase, K, N]
     ) -> torch.Tensor:
         """
-        SLOT path (in_dim == d):
-          x_btnkd: [B,T,N,K,d]
-        returns:
-          qkv_stream: [B,T,K,N,3d]
-        """
-        B, T, N, K, d = x_btnkd.shape
-        assert (N, K, d) == (self.N, self.K, self.d)
-        assert self.in_dim == d
+        SLOT scope projection.
 
-        # -> [B,T,K,N,d]
-        x_btknd = x_btnkd.permute(0, 1, 3, 2, 4)
+        Input:
+          x_btknd : [B, T, K, N, d]
+        Output:
+          qkv_btk_n3d : [B, T, K, N, 3d]
+        """
+        B, T, K, N, d = x_btknd.shape
+        assert (K, N, d) == (self.K, self.N, self.d)
+        assert self.in_dim == d, "project_slot requires in_dim == d"
 
         if self.assignment == StreamHeadAssignment.PRIVATE:
-            # head-order == stream-order along N
-            return _project_bmm(x_btknd, self.Wqkv)  # [B,T,K,N,3d]
+            # No routing needed: head == stream
+            return _project_bmm_btkni(x_btknd, self.Wqkv)
 
-        inv_kn = invperm[phase]                      # [K,N] head->stream
-        x_head = _streams_to_heads(x_btknd, inv_kn)   # [B,T,K,N,d] head-order
+        # Route streams -> heads so head i gets the right stream's input at this phase.
+        h2s_kn = head_to_stream[phase]                         # [K, N]
+        x_head_btknd = _route_streams_to_heads_btkni(x_btknd, h2s_kn)
 
-        qkv_head = _project_bmm(x_head, self.Wqkv)     # [B,T,K,N,3d] head-order
+        # Apply per-(k,head) projection
+        qkv_head_btk_n3d = _project_bmm_btkni(x_head_btknd, self.Wqkv)
 
-        perm_kn = perm[phase]                         # [K,N] stream->head
-        qkv_stream = _heads_to_streams(qkv_head, perm_kn)
-        return qkv_stream
+        # Route heads -> streams so stream n receives the head assigned to it at this phase.
+        s2h_kn = stream_to_head[phase]                         # [K, N]
+        qkv_stream_btk_n3d = _route_heads_to_streams_btkni(qkv_head_btk_n3d, s2h_kn)
+        return qkv_stream_btk_n3d
 
     def project_stream(
         self,
-        x_btni: torch.Tensor,   # [B,T,N,in_dim] stream-order
+        x_btni: torch.Tensor,  # [B, T, N, in_dim] (stream-order)
         *,
         phase: int,
-        perm: torch.Tensor,
-        invperm: torch.Tensor,
+        stream_to_head: torch.Tensor,
+        head_to_stream: torch.Tensor,
     ) -> torch.Tensor:
         """
-        STREAM / SCALES path:
-          x_btni: [B,T,N,in_dim]
-        returns:
-          qkv_stream: [B,T,K,N,3d]
+        STREAM or SCALES scope projection.
+
+        Input:
+          x_btni : [B, T, N, in_dim]
+        Output:
+          qkv_btk_n3d : [B, T, K, N, 3d]
         """
         B, T, N, in_dim = x_btni.shape
         assert (N, in_dim) == (self.N, self.in_dim)
-        K, d = self.K, self.d
 
-        # PRIVATE: fully vectorized without materializing Kx input
+        # PRIVATE: fully vectorized without materializing K copies of x.
         if self.assignment == StreamHeadAssignment.PRIVATE:
-            # [B,T,N,in] x [K,N,in,3d] -> [B,T,K,N,3d]
+            # x: [B,T,N,in] , W: [K,N,in,3d] -> [B,T,K,N,3d]
             return torch.einsum("btni,knio->btkno", x_btni, self.Wqkv)
 
-        # SHARED: choose vectorized vs loop (memory budget)
-        bytes_x_head = x_btni.numel() * K * x_btni.element_size()
-        can_vectorize = bytes_x_head <= self.max_shared_xhead_bytes
+        # SHARED: decide between vectorized broadcast vs loop based on memory budget.
+        bytes_if_broadcast = x_btni.numel() * self.K * x_btni.element_size()
+        can_vectorize = bytes_if_broadcast <= self.max_shared_xhead_bytes
 
         if can_vectorize:
-            # broadcast to [B,T,K,N,in]
-            x_btkni = x_btni.unsqueeze(2).expand(B, T, K, N, in_dim)
-            inv_kn = invperm[phase]                    # [K,N]
-            x_head = _streams_to_heads(x_btkni, inv_kn) # [B,T,K,N,in] head-order
+            # Broadcast x across K: [B, T, 1, N, in] -> [B, T, K, N, in]
+            x_btkni = x_btni.unsqueeze(2).expand(B, T, self.K, N, in_dim)
 
-            qkv_head = _project_bmm(x_head, self.Wqkv)  # [B,T,K,N,3d] head-order
+            # Route streams -> heads at this phase
+            h2s_kn = head_to_stream[phase]  # [K, N]
+            x_head_btkni = _route_streams_to_heads_btkni(x_btkni, h2s_kn)
 
-            perm_kn = perm[phase]                       # [K,N]
-            return _heads_to_streams(qkv_head, perm_kn)  # [B,T,K,N,3d] stream-order
+            # Project
+            qkv_head_btk_n3d = _project_bmm_btkni(x_head_btkni, self.Wqkv)
 
-        # fallback loop over scales (memory-safe)
+            # Route heads -> streams
+            s2h_kn = stream_to_head[phase]  # [K, N]
+            return _route_heads_to_streams_btkni(qkv_head_btk_n3d, s2h_kn)
+
+        # Memory-safe fallback: loop over scales (K is typically small).
         qkv_per_k: List[torch.Tensor] = []
-        for k_idx in range(K):
-            inv_k = invperm[phase, k_idx]                  # [N] head->stream
-            x_head_k = x_btni.index_select(dim=2, index=inv_k)  # [B,T,N,in] head-order
+        for k in range(self.K):
+            # head_to_stream for this scale: [N]
+            h2s_n = head_to_stream[phase, k]  # [N]
+            x_head_btni = x_btni.index_select(dim=2, index=h2s_n)  # [B, T, N, in] head-order
 
-            # bmm across N heads
-            x_h = x_head_k.permute(2, 0, 1, 3).reshape(N, B * T, in_dim)  # [N, BT, in]
-            w_k = self.Wqkv[k_idx]                                        # [N, in, 3d]
-            qkv_h = torch.bmm(x_h, w_k)                                   # [N, BT, 3d]
-            qkv_head_k = qkv_h.reshape(N, B, T, 3 * d).permute(1, 2, 0, 3) # [B,T,N,3d] head-order
+            # Grouped bmm across N heads for this one scale
+            x_n_bti = x_head_btni.permute(2, 0, 1, 3).reshape(N, B * T, in_dim)  # [N, BT, in]
+            w_nio = self.Wqkv[k]                                                 # [N, in, 3d]
+            qkv_n_bto = torch.bmm(x_n_bti, w_nio)                                 # [N, BT, 3d]
 
-            perm_k = perm[phase, k_idx]                                   # [N] stream->head
-            qkv_stream_k = qkv_head_k.index_select(dim=2, index=perm_k)   # [B,T,N,3d] stream-order
-            qkv_per_k.append(qkv_stream_k.unsqueeze(2))                   # [B,T,1,N,3d]
+            qkv_head_btn_3d = qkv_n_bto.reshape(N, B, T, 3 * self.d).permute(1, 2, 0, 3)  # [B, T, N, 3d]
 
-        return torch.cat(qkv_per_k, dim=2)  # [B,T,K,N,3d]
+            # route head-order -> stream-order
+            s2h_n = stream_to_head[phase, k]  # [N]
+            qkv_stream_btn_3d = qkv_head_btn_3d.index_select(dim=2, index=s2h_n)  # [B, T, N, 3d]
+            qkv_per_k.append(qkv_stream_btn_3d.unsqueeze(2))                      # [B, T, 1, N, 3d]
+
+        return torch.cat(qkv_per_k, dim=2)  # [B, T, K, N, 3d]
 
 
 # =============================================================================
-# Attention adapter (SDPA vs FlashAttention-3) with one internal QKV format
+# Attention adapter (SDPA vs FlashAttention-3)
 # =============================================================================
 class AttentionAdapter(nn.Module):
     """
-    Internal QKV format:
-      qkv_stream: [B,T,K,N,3d] (stream-order along N)
-    Output:
-      out: [B,T,N,K,d] (stream-order along N, matches z_active)
+    Attention over (K * N) heads, where each (k, n) is a head.
+
+    Input (consistent with QKVProjector):
+      qkv_btk_n3d : [B, T, K, N, 3d]
+
+    Output (consistent shape/layout):
+      out_btknd : [B, T, K, N, d]
+
+    We flatten heads as:
+      H = K * N
+      head_index = k * N + n    (scale-major head order)
     """
+
     def __init__(self, backend: AttnBackend):
         super().__init__()
         self.backend = backend
 
         self._flash_attn_func = None
         self._flash_qkvpacked_func = None
+
         if backend in (AttnBackend.FLASH3, AttnBackend.FLASH3_QKVPACKED):
             try:
                 from flash_attn import flash_attn_func, flash_attn_qkvpacked_func
@@ -375,59 +496,71 @@ class AttentionAdapter(nn.Module):
 
     @staticmethod
     def _effective_dropout_p(p: float, training: bool) -> float:
+        # Match SDPA/FlashAttn conventions: dropout only when training *and* grads enabled.
         return p if (training and torch.is_grad_enabled()) else 0.0
 
     def forward(
         self,
-        qkv_stream_btk_n3d: torch.Tensor,  # [B,T,K,N,3d]
+        qkv_btk_n3d: torch.Tensor,  # [B, T, K, N, 3d]
         *,
         is_causal: bool,
         dropout_p: float,
     ) -> torch.Tensor:
-        B, T, K, N, three_d = qkv_stream_btk_n3d.shape
+        B, T, K, N, three_d = qkv_btk_n3d.shape
         assert three_d % 3 == 0
         d = three_d // 3
-        H = N * K
+        H = K * N
 
         p = self._effective_dropout_p(dropout_p, self.training)
 
-        # Pack heads as H = N*K in (N,K) order
-        # [B,T,K,N,3d] -> [B,T,N,K,3d] -> [B,T,H,3d]
-        qkv_btnk3d = qkv_stream_btk_n3d.permute(0, 1, 3, 2, 4).reshape(B, T, H, 3 * d)
+        # Flatten heads (k,n) -> h in scale-major order: h = k*N + n
+        # [B, T, K, N, 3d] -> [B, T, H, 3d]
+        qkv_bth_3d = qkv_btk_n3d.reshape(B, T, H, 3 * d)
+        qkv_bth3d = qkv_bth_3d.reshape(B, T, H, 3, d)  # [B, T, H, 3, d]
 
         if self.backend == AttnBackend.SDPA:
-            # SDPA: q,k,v [B,H,T,d]
-            qkv = qkv_btnk3d.reshape(B, T, H, 3, d)
-            q = qkv[..., 0, :].transpose(1, 2)  # [B,H,T,d]
-            k = qkv[..., 1, :].transpose(1, 2)
-            v = qkv[..., 2, :].transpose(1, 2)
+            # SDPA expects q,k,v as [B, H, T, d]
+            q_bhtd = qkv_bth3d[..., 0, :].permute(0, 2, 1, 3)
+            k_bhtd = qkv_bth3d[..., 1, :].permute(0, 2, 1, 3)
+            v_bhtd = qkv_bth3d[..., 2, :].permute(0, 2, 1, 3)
 
             out_bhtd = F.scaled_dot_product_attention(
-                q, k, v, is_causal=is_causal, dropout_p=p
-            )  # [B,H,T,d]
-            out_bthd = out_bhtd.transpose(1, 2)  # [B,T,H,d]
+                q_bhtd, k_bhtd, v_bhtd, is_causal=is_causal, dropout_p=p
+            )  # [B, H, T, d]
 
-        elif self.backend == AttnBackend.FLASH3:
-            # FlashAttn: q,k,v [B,T,H,d]
-            qkv = qkv_btnk3d.reshape(B, T, H, 3, d)
-            q = qkv[..., 0, :].contiguous()
-            k = qkv[..., 1, :].contiguous()
-            v = qkv[..., 2, :].contiguous()
-            out_bthd = self._flash_attn_func(q, k, v, dropout_p=p, causal=is_causal)
+            # Unflatten heads back to [B, T, K, N, d] without extra transposes/copies.
+            out_bkntd = out_bhtd.reshape(B, K, N, T, d)          # [B, K, N, T, d]
+            out_btknd = out_bkntd.permute(0, 3, 1, 2, 4)         # [B, T, K, N, d]
+            return out_btknd
 
-        else:  # FLASH3_QKVPACKED
-            # qkvpacked: [B,T,3,H,d]
-            qkv = qkv_btnk3d.reshape(B, T, H, 3, d).permute(0, 1, 3, 2, 4).contiguous()
-            out_bthd = self._flash_qkvpacked_func(qkv, dropout_p=p, causal=is_causal)
+        if self.backend == AttnBackend.FLASH3:
+            # FlashAttn expects q,k,v as [B, T, H, d]
+            q_bthd = qkv_bth3d[..., 0, :].contiguous()
+            k_bthd = qkv_bth3d[..., 1, :].contiguous()
+            v_bthd = qkv_bth3d[..., 2, :].contiguous()
 
-        # Unpack back to [B,T,N,K,d]
-        out_btnkd = out_bthd.reshape(B, T, N, K, d)
-        return out_btnkd
+            out_bthd = self._flash_attn_func(q_bthd, k_bthd, v_bthd, dropout_p=p, causal=is_causal)
+            return out_bthd.reshape(B, T, K, N, d)
 
-# -----------------------------
+        # FLASH3_QKVPACKED: qkvpacked is [B, T, 3, H, d]
+        qkvpacked_bt3hd = qkv_bth3d.permute(0, 1, 3, 2, 4).contiguous()
+        out_bthd = self._flash_qkvpacked_func(qkvpacked_bt3hd, dropout_p=p, causal=is_causal)
+        return out_bthd.reshape(B, T, K, N, d)
+
+
+# =============================================================================
 # Morpher
-# -----------------------------
+# =============================================================================
 class Morpher(nn.Module):
+    """
+    The full model.
+
+    Parameters:
+      io_dim: input/output feature dim
+      d:      per-slot dim
+      time_scales: list of periods; K=len(time_scales), N=lcm(time_scales), S=sum(time_scales)
+      enc_dec_rank: LoRA rank used in encoder/decoder bottlenecks
+    """
 
     def __init__(
         self,
@@ -443,6 +576,7 @@ class Morpher(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+
         time_scales = sorted(time_scales)
         assert time_scales[0] == 1, "include scale=1 as fastest"
         assert stream_head_assignment in StreamHeadAssignment
@@ -456,52 +590,53 @@ class Morpher(nn.Module):
         self.dropout_mixer = Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
         self.dropout_attn = Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
 
-        # K = number of scales updated per micro-step
+        # K = number of scales
         self.K = len(self.time_scales)
+
+        # d = slot feature width
         self.d = d
 
-        # N = number of streams / phase period
+        # N = number of streams (also the phase period)
         self.N = lcm_list(self.time_scales)
 
-        # S = number of slots per stream
+        # S = total slots per stream (sum of scale periods)
         self.S = sum(self.time_scales)
 
-        # D = stream state dim
+        # D = stream state width
         self.D = self.S * self.d
 
-        # Tables (init-time)
+        # Precomputed phase tables
         self.tables = PhaseTables(self.time_scales, self.stream_head_assignment)
-
 
         # Encoder / Decoder
         self.encoder = StreamLoRAEncoder(io_dim, self.D, self.N, enc_dec_rank)
         self.decoder = StreamLoRADecoder(self.N, self.D, io_dim, enc_dec_rank)
 
-        # Mixer
+        # Mixer (per-stream MLP over full state)
         self.mixer_expansion = mixer_expansion
         self.ln_mixer = NoParamRMSNorm(self.D)
         self.mixer = SwiGLU(self.D, self.mixer_expansion)
 
-        # Attention input dims per scope
+        # Attention input dim depends on scope
         if self.head_input_scope == HeadInputScope.SLOT:
-            self.head_input_dim = self.d
+            head_in_dim = self.d
         elif self.head_input_scope == HeadInputScope.SCALES:
-            self.head_input_dim = self.K * self.d
-        else:
-            self.head_input_dim = self.D
+            head_in_dim = self.K * self.d
+        else:  # STREAM
+            head_in_dim = self.D
 
+        self.head_input_dim = head_in_dim
         self.ln_attn = NoParamRMSNorm(self.head_input_dim)
 
-
-        # QKV projector produces packed [B,T,K,N,3d]
+        # QKV projector produces [B, T, K, N, 3d]
         self.projector = QKVProjector(
             K=self.K,
             N=self.N,
             d=self.d,
             in_dim=self.head_input_dim,
             assignment=self.stream_head_assignment,
-            # If SHARED, vectorizing across K requires materializing x_head = [B,T,K,N,in_dim].
-            # We only do that if it stays under this budget.
+            # For SHARED + stream/scales scope, vectorizing across K means materializing
+            # x_btkni=[B,T,K,N,in]. We only do that if it stays under this budget.
             max_shared_xhead_bytes=128 * 1024 * 1024,
         )
 
@@ -510,120 +645,156 @@ class Morpher(nn.Module):
 
         self.reset_parameters()
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
         self.encoder.reset_parameters()
         self.decoder.reset_parameters()
         self.mixer.reset_parameters()
         self.projector.reset_parameters()
 
+    # -------------------------------------------------------------------------
+    # One micro-step
+    # -------------------------------------------------------------------------
+    def step(self, z_btnd: torch.Tensor, t: int, is_causal: bool) -> torch.Tensor:
+        """
+        One micro-step update.
 
-    # -----------------------------
-    # Core micro-step
-    # -----------------------------
-    def step(self, z: torch.Tensor, t: int, is_causal: bool) -> torch.Tensor:
+        Input:
+          z_btnd : [B, T, N, D]
+
+        Output:
+          z_next_btnd : [B, T, N, D]
         """
-        z: [B,T,N,D]
-        """
-        B, T, N, D = z.shape
+        B, T, N, D = z_btnd.shape
         assert (N, D) == (self.N, self.D)
 
         phase = t % self.N
-        active_slots: torch.Tensor = self.tables.active_slots[phase]  # [K]
+        active_slots_k: torch.Tensor = self.tables.active_slots[phase]  # [K] (slot indices)
 
-        # Mixer
-        z_head = z + self.dropout_mixer(self.mixer(self.ln_mixer(z)))  # [B,T,N,D]
+        # ---- 1) Mixer (per-stream)
+        z_mixed_btnd = z_btnd + self.dropout_mixer(self.mixer(self.ln_mixer(z_btnd)))  # [B, T, N, D]
 
-        # Slot view
-        z_slots = z_head.view(B, T, N, self.S, self.d)  # view
-        z_active = z_slots.index_select(3, active_slots)  # [B,T,N,K,d]
+        # ---- 2) Slot view + select active slots
+        z_slots_btnsd = z_mixed_btnd.view(B, T, N, self.S, self.d)              # [B, T, N, S, d]
+        z_active_btnkd = z_slots_btnsd.index_select(dim=3, index=active_slots_k)  # [B, T, N, K, d]
 
-        # Build Q/K/V
+        # We keep attention pipeline in scale-major layout for consistency and efficiency:
+        z_active_btknd = z_active_btnkd.permute(0, 1, 3, 2, 4)  # [B, T, K, N, d] (view)
+
+        # ---- 3) Build QKV (always returns [B, T, K, N, 3d])
         if self.head_input_scope == HeadInputScope.SLOT:
-            # LN over last dim d for each active slot
-            x_slot = self.ln_attn(z_active)  # [B,T,N,K,d]
-            qkv_stream = self.projector.project_slot(
-                            x_slot,
-                            phase=phase,
-                            perm=self.tables.perm,
-                            invperm=self.tables.invperm,
-                        )
-        elif self.head_input_scope == HeadInputScope.SCALES:
-            # LN over concatenated active slots
-            x_scales = self.ln_attn(z_active.reshape(B, T, N, self.K * self.d))  # [B,T,N,K*d]
-            qkv_stream = self.projector.project_stream(
-                x_scales,
+            # LN over last dim (d) per active slot
+            x_btnkd = self.ln_attn(z_active_btnkd)                  # [B, T, N, K, d]
+            x_btknd = x_btnkd.permute(0, 1, 3, 2, 4)                # [B, T, K, N, d]
+
+            qkv_btk_n3d = self.projector.project_slot(
+                x_btknd,
                 phase=phase,
-                perm=self.tables.perm,
-                invperm=self.tables.invperm,
+                stream_to_head=self.tables.stream_to_head,
+                head_to_stream=self.tables.head_to_stream,
             )
+
+        elif self.head_input_scope == HeadInputScope.SCALES:
+            # Concat active slots per stream: [B, T, N, K*d]
+            x_btni = z_active_btnkd.reshape(B, T, N, self.K * self.d)  # [B, T, N, K*d]
+            x_btni = self.ln_attn(x_btni)
+
+            qkv_btk_n3d = self.projector.project_stream(
+                x_btni,
+                phase=phase,
+                stream_to_head=self.tables.stream_to_head,
+                head_to_stream=self.tables.head_to_stream,
+            )
+
         else:  # STREAM
-            x_stream = self.ln_attn(z_head)  # [B,T,N,D]
-            qkv_stream = self.projector.project_stream(
-                    x_stream,
-                    phase=phase,
-                    perm=self.tables.perm,
-                    invperm=self.tables.invperm,
-                )
+            # Full stream state per head input
+            x_btni = self.ln_attn(z_mixed_btnd)  # [B, T, N, D]
 
+            qkv_btk_n3d = self.projector.project_stream(
+                x_btni,
+                phase=phase,
+                stream_to_head=self.tables.stream_to_head,
+                head_to_stream=self.tables.head_to_stream,
+            )
 
-        # Attend: out [B,T,N,K,d] in stream order
-        out = self.attn(qkv_stream, is_causal=is_causal, dropout_p=self.dropout_p)
-        out = self.dropout_attn(out)
+        # ---- 4) Attention over streams/scales
+        out_btknd = self.attn(qkv_btk_n3d, is_causal=is_causal, dropout_p=self.dropout_p)  # [B, T, K, N, d]
+        out_btknd = self.dropout_attn(out_btknd)
 
         # Residual on active slots
-        out = out + z_active
+        out_btknd = out_btknd + z_active_btknd  # [B, T, K, N, d]
 
-        # Write-back only active slots: clone flat state once
-        z_next = z_head.clone()
-        z_next_slots = z_next.view(B, T, N, self.S, self.d)
-        z_next_slots.index_copy_(3, active_slots, out)
+        # ---- 5) Write back only active slots into the full state
+        # Convert back to stream-major active-slot layout for index_copy_:
+        out_btnkd = out_btknd.permute(0, 1, 3, 2, 4)  # [B, T, N, K, d]
 
-        return z_next
+        # Clone full state once, then update only the active slots.
+        z_next_btnd = z_mixed_btnd.clone()
+        z_next_slots_btnsd = z_next_btnd.view(B, T, N, self.S, self.d)
+        z_next_slots_btnsd.index_copy_(dim=3, index=active_slots_k, source=out_btnkd)
 
-    # -----------------------------
-    # Cycle and forward (burn-in + graft + short unroll)
-    # -----------------------------
-    def forward_cycle(self, z: torch.Tensor, t0: int, is_causal: bool) -> torch.Tensor:
-        for dt in range(self.N):
-            z = self.step(z, t=t0 + dt, is_causal=is_causal)
-        return z
+        return z_next_btnd
 
-    def forward(
-        self, x: torch.Tensor, R: int, is_causal: bool, grad_cycles: int = 1
-    ) -> torch.Tensor:
+    # -------------------------------------------------------------------------
+    # Cycle update
+    # -------------------------------------------------------------------------
+    def forward_cycle(self, z_btnd: torch.Tensor, t0: int, is_causal: bool) -> torch.Tensor:
         """
-        R: total cycles
-        grad_cycles: number of final cycles to backprop through (1 = last cycle only)
+        Run one full phase cycle of length N micro-steps.
+        """
+        for dt in range(self.N):
+            z_btnd = self.step(z_btnd, t=t0 + dt, is_causal=is_causal)
+        return z_btnd
+
+    # -------------------------------------------------------------------------
+    # Forward (burn-in + graft + short unroll)
+    # -------------------------------------------------------------------------
+    def forward(self, x_bti: torch.Tensor, R: int, is_causal: bool, grad_cycles: int = 1) -> torch.Tensor:
+        """
+        Forward pass with optional burn-in.
+
+        Args:
+          x_bti: [B, T, io_dim]
+          R: number of cycles total
+          grad_cycles: how many final cycles to backprop through (>=1, <=R)
+
+        Strategy:
+          - Encode to z0 (with grad)
+          - Burn-in for (R - grad_cycles) cycles without autograd graph
+          - "Gradient graft": keep burned-in value, but attach gradients as if starting from z0
+          - Run grad_cycles cycles with autograd
+          - Decode to output
         """
         assert 1 <= grad_cycles <= R
         burn_cycles = R - grad_cycles
 
-        # encoder must have grad so stacking works
-        z0 = self.encoder(x)  # [B,T,N,D] with grad
+        # Encoder must have grad so stacking works
+        z0_btnd = self.encoder(x_bti)  # [B, T, N, D] with grad
+        z_btnd = z0_btnd.detach()
 
-        # burn-in without graph
-        z = z0.detach()
         t = 0
         if burn_cycles > 0:
+            # Burn-in without graph (fast + low memory)
             with torch.inference_mode():
                 for _ in range(burn_cycles):
-                    z = self.forward_cycle(z, t0=t, is_causal=is_causal)
+                    z_btnd = self.forward_cycle(z_btnd, t0=t, is_causal=is_causal)
                     t += self.N
 
-        # gradient graft: value from burned-in z, gradient from z0
-        z = z.detach() + (z0 - z0.detach())
+        # Gradient graft:
+        #   - value comes from burned-in z_btnd (no-grad)
+        #   - gradient flows from z0_btnd
+        z_btnd = z_btnd.detach() + (z0_btnd - z0_btnd.detach())
 
-        # final cycles with grad
+        # Final cycles with grad
         for _ in range(grad_cycles):
-            z = self.forward_cycle(z, t0=t, is_causal=is_causal)
+            z_btnd = self.forward_cycle(z_btnd, t0=t, is_causal=is_causal)
             t += self.N
 
-        return self.decoder(z)
+        return self.decoder(z_btnd)
 
 
-# -----------------------------
+# =============================================================================
 # Example / sanity test
-# -----------------------------
+# =============================================================================
 if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
@@ -631,7 +802,7 @@ if __name__ == "__main__":
     B, T, io_dim = 4, 10, 16
     time_scales = [1, 2, 4]
     d = 12
-    mixer_expansion = 4.0  # Expansion factor for SwiGLU
+    mixer_expansion = 4.0
     enc_dec_rank = 8
 
     model = Morpher(
@@ -642,6 +813,7 @@ if __name__ == "__main__":
         mixer_expansion=mixer_expansion,
         stream_head_assignment=StreamHeadAssignment.PRIVATE,
         head_input_scope=HeadInputScope.SLOT,  # try STREAM / SCALES too
+        attn_backend=AttnBackend.SDPA,         # try FLASH3 / FLASH3_QKVPACKED if available
         dropout=0.1,
     )
 
