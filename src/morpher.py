@@ -123,7 +123,10 @@ class HeadInputScope(StrEnum):
     STREAM = "stream"
     SCALES = "scales"
 
-
+class AttnBackend(StrEnum):
+    SDPA = "sdpa"
+    FLASH3 = "flash3"                    # flash_attn_func(q,k,v) with q,k,v [B,T,H,d]
+    FLASH3_QKVPACKED = "flash3_qkvpacked" # flash_attn_qkvpacked_func(qkv) with qkv [B,T,3,H,d]
 
 # =============================================================================
 # Phase tables (init-time only)
@@ -184,6 +187,243 @@ class PhaseTables(nn.Module):
         return perm, inv  # each [N, K, N]
 
 
+# =============================================================================
+# QKV projection + routing (returns packed QKV once)
+# =============================================================================
+def _streams_to_heads(x_btkni: torch.Tensor, inv_kn: torch.Tensor) -> torch.Tensor:
+    """
+    x_btkni: [B,T,K,N,in] in stream-order along N
+    inv_kn:  [K,N] head->stream
+    returns: [B,T,K,N,in] in head-order along N
+    """
+    B, T, K, N, in_dim = x_btkni.shape
+    idx = inv_kn.view(1, 1, K, N, 1).expand(B, T, K, N, in_dim)
+    return torch.gather(x_btkni, dim=3, index=idx)
+
+
+def _heads_to_streams(x_btkni: torch.Tensor, perm_kn: torch.Tensor) -> torch.Tensor:
+    """
+    x_btkni: [B,T,K,N,in] in head-order along N
+    perm_kn: [K,N] stream->head
+    returns: [B,T,K,N,in] in stream-order along N
+    """
+    B, T, K, N, in_dim = x_btkni.shape
+    idx = perm_kn.view(1, 1, K, N, 1).expand(B, T, K, N, in_dim)
+    return torch.gather(x_btkni, dim=3, index=idx)
+
+
+def _project_bmm(x_btkni: torch.Tensor, w_knio: torch.Tensor) -> torch.Tensor:
+    """
+    x: [B,T,K,N,in]
+    w: [K,N,in,3d]
+    -> qkv: [B,T,K,N,3d]
+    """
+    B, T, K, N, in_dim = x_btkni.shape
+    x = x_btkni.permute(2, 3, 0, 1, 4).reshape(K * N, B * T, in_dim)     # [K*N, BT, in]
+    w = w_knio.reshape(K * N, in_dim, -1)                                 # [K*N, in, 3d]
+    y = torch.bmm(x, w).reshape(K, N, B, T, -1).permute(2, 3, 0, 1, 4)    # [B,T,K,N,3d]
+    return y
+
+
+class QKVProjector(nn.Module):
+    """
+    Owns Wqkv and produces packed QKV in *stream order*:
+      qkv_stream: [B,T,K,N,3d]
+    """
+    def __init__(
+        self,
+        *,
+        K: int,
+        N: int,
+        d: int,
+        in_dim: int,
+        assignment: StreamHeadAssignment,
+        max_shared_xhead_bytes: int = 128 * 1024 * 1024,
+    ):
+        super().__init__()
+        self.K = K
+        self.N = N
+        self.d = d
+        self.in_dim = in_dim
+        self.assignment = assignment
+        self.max_shared_xhead_bytes = int(max_shared_xhead_bytes)
+
+        self.Wqkv = nn.Parameter(torch.empty(K, N, in_dim, 3 * d))
+
+    def reset_parameters(self) -> None:
+        w_flat = self.Wqkv.view(-1, self.in_dim, 3 * self.d)
+        trunc_normal_init_(w_flat, std=1.0 / (self.in_dim ** 0.5))
+
+    def project_slot(
+        self,
+        x_btnkd: torch.Tensor,  # [B,T,N,K,d] stream-order
+        *,
+        phase: int,
+        perm: torch.Tensor,     # [Nphase,K,N]
+        invperm: torch.Tensor,  # [Nphase,K,N]
+    ) -> torch.Tensor:
+        """
+        SLOT path (in_dim == d):
+          x_btnkd: [B,T,N,K,d]
+        returns:
+          qkv_stream: [B,T,K,N,3d]
+        """
+        B, T, N, K, d = x_btnkd.shape
+        assert (N, K, d) == (self.N, self.K, self.d)
+        assert self.in_dim == d
+
+        # -> [B,T,K,N,d]
+        x_btknd = x_btnkd.permute(0, 1, 3, 2, 4)
+
+        if self.assignment == StreamHeadAssignment.PRIVATE:
+            # head-order == stream-order along N
+            return _project_bmm(x_btknd, self.Wqkv)  # [B,T,K,N,3d]
+
+        inv_kn = invperm[phase]                      # [K,N] head->stream
+        x_head = _streams_to_heads(x_btknd, inv_kn)   # [B,T,K,N,d] head-order
+
+        qkv_head = _project_bmm(x_head, self.Wqkv)     # [B,T,K,N,3d] head-order
+
+        perm_kn = perm[phase]                         # [K,N] stream->head
+        qkv_stream = _heads_to_streams(qkv_head, perm_kn)
+        return qkv_stream
+
+    def project_stream(
+        self,
+        x_btni: torch.Tensor,   # [B,T,N,in_dim] stream-order
+        *,
+        phase: int,
+        perm: torch.Tensor,
+        invperm: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        STREAM / SCALES path:
+          x_btni: [B,T,N,in_dim]
+        returns:
+          qkv_stream: [B,T,K,N,3d]
+        """
+        B, T, N, in_dim = x_btni.shape
+        assert (N, in_dim) == (self.N, self.in_dim)
+        K, d = self.K, self.d
+
+        # PRIVATE: fully vectorized without materializing Kx input
+        if self.assignment == StreamHeadAssignment.PRIVATE:
+            # [B,T,N,in] x [K,N,in,3d] -> [B,T,K,N,3d]
+            return torch.einsum("btni,knio->btkno", x_btni, self.Wqkv)
+
+        # SHARED: choose vectorized vs loop (memory budget)
+        bytes_x_head = x_btni.numel() * K * x_btni.element_size()
+        can_vectorize = bytes_x_head <= self.max_shared_xhead_bytes
+
+        if can_vectorize:
+            # broadcast to [B,T,K,N,in]
+            x_btkni = x_btni.unsqueeze(2).expand(B, T, K, N, in_dim)
+            inv_kn = invperm[phase]                    # [K,N]
+            x_head = _streams_to_heads(x_btkni, inv_kn) # [B,T,K,N,in] head-order
+
+            qkv_head = _project_bmm(x_head, self.Wqkv)  # [B,T,K,N,3d] head-order
+
+            perm_kn = perm[phase]                       # [K,N]
+            return _heads_to_streams(qkv_head, perm_kn)  # [B,T,K,N,3d] stream-order
+
+        # fallback loop over scales (memory-safe)
+        qkv_per_k: List[torch.Tensor] = []
+        for k_idx in range(K):
+            inv_k = invperm[phase, k_idx]                  # [N] head->stream
+            x_head_k = x_btni.index_select(dim=2, index=inv_k)  # [B,T,N,in] head-order
+
+            # bmm across N heads
+            x_h = x_head_k.permute(2, 0, 1, 3).reshape(N, B * T, in_dim)  # [N, BT, in]
+            w_k = self.Wqkv[k_idx]                                        # [N, in, 3d]
+            qkv_h = torch.bmm(x_h, w_k)                                   # [N, BT, 3d]
+            qkv_head_k = qkv_h.reshape(N, B, T, 3 * d).permute(1, 2, 0, 3) # [B,T,N,3d] head-order
+
+            perm_k = perm[phase, k_idx]                                   # [N] stream->head
+            qkv_stream_k = qkv_head_k.index_select(dim=2, index=perm_k)   # [B,T,N,3d] stream-order
+            qkv_per_k.append(qkv_stream_k.unsqueeze(2))                   # [B,T,1,N,3d]
+
+        return torch.cat(qkv_per_k, dim=2)  # [B,T,K,N,3d]
+
+
+# =============================================================================
+# Attention adapter (SDPA vs FlashAttention-3) with one internal QKV format
+# =============================================================================
+class AttentionAdapter(nn.Module):
+    """
+    Internal QKV format:
+      qkv_stream: [B,T,K,N,3d] (stream-order along N)
+    Output:
+      out: [B,T,N,K,d] (stream-order along N, matches z_active)
+    """
+    def __init__(self, backend: AttnBackend):
+        super().__init__()
+        self.backend = backend
+
+        self._flash_attn_func = None
+        self._flash_qkvpacked_func = None
+        if backend in (AttnBackend.FLASH3, AttnBackend.FLASH3_QKVPACKED):
+            try:
+                from flash_attn import flash_attn_func, flash_attn_qkvpacked_func
+            except Exception as e:
+                raise ImportError(
+                    "Requested FlashAttention-3 backend but flash_attn is not importable. "
+                    "Install flash-attn (and ensure you're on a supported CUDA setup), "
+                    "or choose AttnBackend.SDPA."
+                ) from e
+            self._flash_attn_func = flash_attn_func
+            self._flash_qkvpacked_func = flash_attn_qkvpacked_func
+
+    @staticmethod
+    def _effective_dropout_p(p: float, training: bool) -> float:
+        return p if (training and torch.is_grad_enabled()) else 0.0
+
+    def forward(
+        self,
+        qkv_stream_btk_n3d: torch.Tensor,  # [B,T,K,N,3d]
+        *,
+        is_causal: bool,
+        dropout_p: float,
+    ) -> torch.Tensor:
+        B, T, K, N, three_d = qkv_stream_btk_n3d.shape
+        assert three_d % 3 == 0
+        d = three_d // 3
+        H = N * K
+
+        p = self._effective_dropout_p(dropout_p, self.training)
+
+        # Pack heads as H = N*K in (N,K) order
+        # [B,T,K,N,3d] -> [B,T,N,K,3d] -> [B,T,H,3d]
+        qkv_btnk3d = qkv_stream_btk_n3d.permute(0, 1, 3, 2, 4).reshape(B, T, H, 3 * d)
+
+        if self.backend == AttnBackend.SDPA:
+            # SDPA: q,k,v [B,H,T,d]
+            qkv = qkv_btnk3d.reshape(B, T, H, 3, d)
+            q = qkv[..., 0, :].transpose(1, 2)  # [B,H,T,d]
+            k = qkv[..., 1, :].transpose(1, 2)
+            v = qkv[..., 2, :].transpose(1, 2)
+
+            out_bhtd = F.scaled_dot_product_attention(
+                q, k, v, is_causal=is_causal, dropout_p=p
+            )  # [B,H,T,d]
+            out_bthd = out_bhtd.transpose(1, 2)  # [B,T,H,d]
+
+        elif self.backend == AttnBackend.FLASH3:
+            # FlashAttn: q,k,v [B,T,H,d]
+            qkv = qkv_btnk3d.reshape(B, T, H, 3, d)
+            q = qkv[..., 0, :].contiguous()
+            k = qkv[..., 1, :].contiguous()
+            v = qkv[..., 2, :].contiguous()
+            out_bthd = self._flash_attn_func(q, k, v, dropout_p=p, causal=is_causal)
+
+        else:  # FLASH3_QKVPACKED
+            # qkvpacked: [B,T,3,H,d]
+            qkv = qkv_btnk3d.reshape(B, T, H, 3, d).permute(0, 1, 3, 2, 4).contiguous()
+            out_bthd = self._flash_qkvpacked_func(qkv, dropout_p=p, causal=is_causal)
+
+        # Unpack back to [B,T,N,K,d]
+        out_btnkd = out_bthd.reshape(B, T, N, K, d)
+        return out_btnkd
+
 # -----------------------------
 # Morpher
 # -----------------------------
@@ -191,6 +431,7 @@ class Morpher(nn.Module):
 
     def __init__(
         self,
+        *,
         io_dim: int,
         d: int,
         time_scales: List[int],
@@ -198,6 +439,7 @@ class Morpher(nn.Module):
         mixer_expansion: float = 4.0,
         stream_head_assignment: StreamHeadAssignment = StreamHeadAssignment.SHARED,
         head_input_scope: HeadInputScope = HeadInputScope.SLOT,
+        attn_backend: AttnBackend = AttnBackend.SDPA,
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -211,12 +453,8 @@ class Morpher(nn.Module):
         self.head_input_scope = head_input_scope
 
         self.dropout_p = float(dropout)
-        self.dropout_mixer = (
-            Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
-        )
-        self.dropout_attn = (
-            Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
-        )
+        self.dropout_mixer = Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
+        self.dropout_attn = Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
 
         # K = number of scales updated per micro-step
         self.K = len(self.time_scales)
@@ -230,6 +468,10 @@ class Morpher(nn.Module):
 
         # D = stream state dim
         self.D = self.S * self.d
+
+        # Tables (init-time)
+        self.tables = PhaseTables(self.time_scales, self.stream_head_assignment)
+
 
         # Encoder / Decoder
         self.encoder = StreamLoRAEncoder(io_dim, self.D, self.N, enc_dec_rank)
@@ -250,228 +492,30 @@ class Morpher(nn.Module):
 
         self.ln_attn = NoParamRMSNorm(self.head_input_dim)
 
-        # Fused Wqkv: [K, N, in_dim, 3d]
-        self.Wqkv = nn.Parameter(
-            torch.empty(self.K, self.N, self.head_input_dim, 3 * self.d)
+
+        # QKV projector produces packed [B,T,K,N,3d]
+        self.projector = QKVProjector(
+            K=self.K,
+            N=self.N,
+            d=self.d,
+            in_dim=self.head_input_dim,
+            assignment=self.stream_head_assignment,
+            # If SHARED, vectorizing across K requires materializing x_head = [B,T,K,N,in_dim].
+            # We only do that if it stays under this budget.
+            max_shared_xhead_bytes=128 * 1024 * 1024,
         )
 
-        # If SHARED, vectorizing across K requires materializing x_head = [B,T,K,N,in_dim].
-        # We only do that if it stays under this budget.
-        self.max_shared_xhead_bytes = (
-            128 * 1024 * 1024
-        )  # 128MB default (safe for most cases)
+        # Attention backend adapter
+        self.attn = AttentionAdapter(attn_backend)
 
-        self.phase_tables = PhaseTables(self.time_scales, self.stream_head_assignment)
         self.reset_parameters()
 
     def reset_parameters(self):
-        # Initialize Wqkv with truncated normal (matches HRM's approach)
-        wqkv_flat = self.Wqkv.view(-1, self.head_input_dim, 3 * self.d)
-        trunc_normal_init_(wqkv_flat, std=1.0 / (self.head_input_dim ** 0.5))
         self.encoder.reset_parameters()
         self.decoder.reset_parameters()
         self.mixer.reset_parameters()
+        self.projector.reset_parameters()
 
-    # -----------------------------
-    # Tables
-    # -----------------------------
-
-    # -----------------------------
-    # QKV projection helpers
-    # -----------------------------
-    def _project_qkv_slot(
-        self, x_head: torch.Tensor, B: int, T: int, N: int, K: int, d: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Common QKV projection logic for both PRIVATE and SHARED wiring.
-        x_head: [B,T,K,N,d] in head order
-        Returns: q_head, k_head, v_head: [B,T,K,N,d] in head order
-        """
-
-        assert self.head_input_dim == d, (
-            f"Common SLOT projector assumes in_dim == d, got {self.head_input_dim} != {d}"
-        )
-
-        # Pack (K*N) heads as batch for bmm
-        x_h = x_head.permute(2, 3, 0, 1, 4).reshape(K * N, B * T, d)  # [K*N, BT, d]
-        w = self.Wqkv.reshape(K * N, d, 3 * d)  # [K*N, d, 3d]
-        qkv_h = torch.bmm(x_h, w)  # [K*N, BT, 3d]
-        qkv = qkv_h.reshape(K, N, B, T, 3 * d).permute(
-            2, 3, 0, 1, 4
-        )  # [B,T,K,N,3d] head order
-        q_head, k_head, v_head = qkv.split(d, dim=-1)  # [B,T,K,N,d] head order
-        return q_head, k_head, v_head
-
-    def _pack_qkv_for_sdpa(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        B: int,
-        T: int,
-        N: int,
-        K: int,
-        d: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Expect either [B,T,K,N,d] OR [B,N,K,T,d]
-        if q.shape == (B, T, K, N, d):
-            q_out = q.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-            k_out = k.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-            v_out = v.permute(0, 3, 2, 1, 4).reshape(B, N * K, T, d)
-            return q_out, k_out, v_out
-
-        if q.shape == (B, N, K, T, d):
-            # This is already [B,N,K,T,d] so just reshape
-            q_out = q.reshape(B, N * K, T, d)
-            k_out = k.reshape(B, N * K, T, d)
-            v_out = v.reshape(B, N * K, T, d)
-            return q_out, k_out, v_out
-
-        raise ValueError(
-            f"Unexpected q shape {tuple(q.shape)} (expected {(B, T, K, N, d)} or {(B, N, K, T, d)})"
-        )
-
-    def _project_qkv_slot_vectorized(
-        self, x_slot: torch.Tensor, phase: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        SLOT fast path (best when in_dim=d):
-          x_slot: [B,T,N,K,d] after LN
-        Returns:
-          q,k,v: [B, N*K, T, d]
-        """
-        B, T, N, K, d = x_slot.shape
-        assert N == self.N and K == self.K and d == self.d
-
-        # [B,T,N,K,d] -> [B,T,K,N,d]
-        x_in = x_slot.permute(0, 1, 3, 2, 4)  # [B,T,K,N,d]
-
-        if self.stream_head_assignment == StreamHeadAssignment.PRIVATE:
-            # Identity wiring: no permutations needed.
-            # Head order == stream order.
-            x_head = x_in  # [B,T,K,N,d]
-            q_head, k_head, v_head = self._project_qkv_slot(x_head, B, T, N, K, d)
-            return self._pack_qkv_for_sdpa(q_head, k_head, v_head, B, T, N, K, d)
-
-        # SHARED wiring: permute streams -> heads and back
-        p: torch.Tensor = self.phase_tables.perm[phase]  # [K,N] stream->head
-        inv: torch.Tensor = self.phase_tables.invperm[phase]  # [K,N] head->stream
-
-        # gather streams into HEAD order along dim=3 (stream axis)
-        inv_idx = inv.view(1, 1, K, N, 1).expand(B, T, K, N, d)
-        x_head = torch.gather(x_in, dim=3, index=inv_idx)  # [B,T,K,N,d] head order
-
-        # Project all (K*N) heads in one batched GEMM
-        q_head, k_head, v_head = self._project_qkv_slot(x_head, B, T, N, K, d)
-
-        # Route HEAD->STREAM: for each stream position s choose head p[k,s]
-        p_idx = p.view(1, 1, K, N, 1).expand(B, T, K, N, d)
-        q_stream = torch.gather(
-            q_head, dim=3, index=p_idx
-        )  # [B,T,K,N,d] (dim=3 now stream)
-        k_stream = torch.gather(k_head, dim=3, index=p_idx)
-        v_stream = torch.gather(v_head, dim=3, index=p_idx)
-
-        # Pack to SDPA format
-        return self._pack_qkv_for_sdpa(q_stream, k_stream, v_stream, B, T, N, K, d)
-
-    def _project_qkv_big_per_scale(self, x_in: torch.Tensor, phase: int):
-        """
-        STREAM/SCALES path:
-        x_in: [B,T,N,in_dim] (LN already applied)
-        Returns:
-        q,k,v: [B, N*K, T, d]
-
-        Strategy:
-        - PRIVATE: vectorize across K via einsum (no Kx input materialization)
-        - SHARED:
-            * if Kx materialization is small enough: vectorize across K with one batched bmm
-            * else: per-scale loop (memory-safe, best for large STREAM dims)
-        """
-        B, T, N, in_dim = x_in.shape
-        assert N == self.N and in_dim == self.head_input_dim
-        d = self.d
-        K = self.K
-
-        # ---------- PRIVATE: fully vectorized, no Kx input materialization ----------
-        if self.stream_head_assignment == StreamHeadAssignment.PRIVATE:
-            # qkv: [B,T,K,N,3d]
-            qkv = torch.einsum("b t n i, k n i o -> b t k n o", x_in, self.Wqkv)
-            q, k, v = qkv.split(d, dim=-1)  # each [B,T,K,N,d]
-            return self._pack_qkv_for_sdpa(q, k, v, B, T, N, K, d)
-
-        # ---------- SHARED: auto-select vectorized vs loop ----------
-        # Vectorized SHARED needs x_head of shape [B,T,K,N,in_dim] (head order),
-        # which is x_in.numel() * K elements.
-        bytes_x_head = x_in.numel() * K * x_in.element_size()
-        can_vectorize = bytes_x_head <= self.max_shared_xhead_bytes
-
-        if can_vectorize:
-            # Build x_broadcast: [B,T,K,N,in_dim] (stream order) as a view (expand is cheap)
-            x_b = x_in.unsqueeze(2).expand(B, T, K, N, in_dim)
-
-            inv: torch.Tensor = self.phase_tables.invperm[phase]  # [K,N] head->stream
-            inv_idx = inv.view(1, 1, K, N, 1).expand(B, T, K, N, in_dim)
-
-            # Reorder streams -> head order for all scales at once
-            x_head = torch.gather(
-                x_b, dim=3, index=inv_idx
-            )  # [B,T,K,N,in_dim] head order
-
-            # Project all K*N heads in one batched bmm
-            x_h = x_head.permute(2, 3, 0, 1, 4).reshape(
-                K * N, B * T, in_dim
-            )  # [K*N, BT, in]
-            w = self.Wqkv.reshape(K * N, in_dim, 3 * d)  # [K*N, in, 3d]
-            qkv_h = torch.bmm(x_h, w)  # [K*N, BT, 3d]
-            qkv = qkv_h.reshape(K, N, B, T, 3 * d).permute(
-                2, 3, 0, 1, 4
-            )  # [B,T,K,N,3d] head order
-            q_head, k_head, v_head = qkv.split(d, dim=-1)  # [B,T,K,N,d] head order
-
-            # Route head -> stream: for each stream position s choose head p[k,s]
-            p: torch.Tensor = self.phase_tables.perm[phase]  # [K,N] stream->head
-            p_idx = p.view(1, 1, K, N, 1).expand(B, T, K, N, d)
-
-            q_stream = torch.gather(
-                q_head, dim=3, index=p_idx
-            )  # [B,T,K,N,d] (dim=3 now stream)
-            k_stream = torch.gather(k_head, dim=3, index=p_idx)
-            v_stream = torch.gather(v_head, dim=3, index=p_idx)
-
-            return self._pack_qkv_for_sdpa(q_stream, k_stream, v_stream, B, T, N, K, d)
-
-        # ---------- SHARED fallback: per-scale loop (memory-safe) ----------
-        q_list, k_list, v_list = [], [], []
-        for k_idx in range(K):
-            inv_k: torch.Tensor = self.phase_tables.invperm[phase, k_idx]  # [N] head->stream
-            x_head_k = x_in.index_select(
-                dim=2, index=inv_k
-            )  # [B,T,N,in_dim] head order
-
-            # bmm across heads=N
-            x_h = x_head_k.permute(2, 0, 1, 3).reshape(N, B * T, in_dim)  # [N, BT, in]
-            w_k = self.Wqkv[k_idx]  # [N, in, 3d]
-            qkv_h = torch.bmm(x_h, w_k)  # [N, BT, 3d]
-            qkv = qkv_h.reshape(N, B, T, 3 * d).permute(
-                1, 2, 0, 3
-            )  # [B,T,N,3d] head order
-            q_head, k_head, v_head = qkv.split(d, dim=-1)  # [B,T,N,d] head order
-
-            # Route back to stream order
-            p_k: torch.Tensor = self.phase_tables.perm[phase, k_idx]  # [N] stream->head
-            q_stream = q_head.index_select(dim=2, index=p_k)
-            k_stream = k_head.index_select(dim=2, index=p_k)
-            v_stream = v_head.index_select(dim=2, index=p_k)
-
-            q_list.append(q_stream.permute(0, 2, 1, 3))  # [B,N,T,d]
-            k_list.append(k_stream.permute(0, 2, 1, 3))
-            v_list.append(v_stream.permute(0, 2, 1, 3))
-
-        q_stacked = torch.stack(q_list, dim=2)  # [B,N,K,T,d]
-        k_stacked = torch.stack(k_list, dim=2)
-        v_stacked = torch.stack(v_list, dim=2)
-        return self._pack_qkv_for_sdpa(q_stacked, k_stacked, v_stacked, B, T, N, K, d)
 
     # -----------------------------
     # Core micro-step
@@ -481,10 +525,10 @@ class Morpher(nn.Module):
         z: [B,T,N,D]
         """
         B, T, N, D = z.shape
-        assert N == self.N and D == self.D
+        assert (N, D) == (self.N, self.D)
 
         phase = t % self.N
-        active_slots: torch.Tensor = self.phase_tables.active_slots[phase]  # [K]
+        active_slots: torch.Tensor = self.tables.active_slots[phase]  # [K]
 
         # Mixer
         z_head = z + self.dropout_mixer(self.mixer(self.ln_mixer(z)))  # [B,T,N,D]
@@ -497,28 +541,36 @@ class Morpher(nn.Module):
         if self.head_input_scope == HeadInputScope.SLOT:
             # LN over last dim d for each active slot
             x_slot = self.ln_attn(z_active)  # [B,T,N,K,d]
-            q, k, v = self._project_qkv_slot_vectorized(x_slot, phase)
-
+            qkv_stream = self.projector.project_slot(
+                            x_slot,
+                            phase=phase,
+                            perm=self.tables.perm,
+                            invperm=self.tables.invperm,
+                        )
         elif self.head_input_scope == HeadInputScope.SCALES:
             # LN over concatenated active slots
-            x_scales = self.ln_attn(
-                z_active.reshape(B, T, N, self.K * self.d)
-            )  # [B,T,N,K*d]
-            q, k, v = self._project_qkv_big_per_scale(x_scales, phase)
-
+            x_scales = self.ln_attn(z_active.reshape(B, T, N, self.K * self.d))  # [B,T,N,K*d]
+            qkv_stream = self.projector.project_stream(
+                x_scales,
+                phase=phase,
+                perm=self.tables.perm,
+                invperm=self.tables.invperm,
+            )
         else:  # STREAM
             x_stream = self.ln_attn(z_head)  # [B,T,N,D]
-            q, k, v = self._project_qkv_big_per_scale(x_stream, phase)
+            qkv_stream = self.projector.project_stream(
+                    x_stream,
+                    phase=phase,
+                    perm=self.tables.perm,
+                    invperm=self.tables.invperm,
+                )
 
-        # SDPA
-        drop_p = self.dropout_p if (self.training and torch.is_grad_enabled()) else 0.0
-        out = F.scaled_dot_product_attention(
-            q, k, v, is_causal=is_causal, dropout_p=drop_p
-        )  # [B, N*K, T, d]
+
+        # Attend: out [B,T,N,K,d] in stream order
+        out = self.attn(qkv_stream, is_causal=is_causal, dropout_p=self.dropout_p)
         out = self.dropout_attn(out)
 
-        # Back to [B,T,N,K,d]
-        out = out.reshape(B, N, self.K, T, self.d).permute(0, 3, 1, 2, 4).contiguous()
+        # Residual on active slots
         out = out + z_active
 
         # Write-back only active slots: clone flat state once
