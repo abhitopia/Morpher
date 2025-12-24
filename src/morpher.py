@@ -7,7 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import NoParamRMSNorm, CastedLinear, SwiGLU, trunc_normal_init_, Dropout, lcm_list
+from utils import (
+    NoParamRMSNorm, CastedLinear, SwiGLU, trunc_normal_init_, Dropout, lcm_list,
+    RotaryEmbedding, apply_rotary_pos_emb,
+)
 
 
 """
@@ -504,6 +507,9 @@ class AttentionAdapter(nn.Module):
         *,
         is_causal: bool,
         dropout_p: float,
+        # RoPE (optional): both are [T, d], already sliced to the current sequence length
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, K, N, three_d = qkv_btk_n3d.shape
         assert three_d % 3 == 0
@@ -517,11 +523,25 @@ class AttentionAdapter(nn.Module):
         qkv_bth_3d = qkv_btk_n3d.reshape(B, T, H, 3 * d)
         qkv_bth3d = qkv_bth_3d.reshape(B, T, H, 3, d)  # [B, T, H, 3, d]
 
+        # --- Unpack q/k/v as [B, T, H, d] (shared across backends) ---
+        q_bthd = qkv_bth3d[..., 0, :]
+        k_bthd = qkv_bth3d[..., 1, :]
+        v_bthd = qkv_bth3d[..., 2, :]
+
+        # --- Apply RoPE to q/k if provided ---
+        # apply_rotary_pos_emb expects:
+        #   q,k: [B, T, H, d]
+        #   cos,sin: [T, d]
+        if cos is not None:
+            # sin should be present too; keep a hard assert to catch wiring mistakes.
+            assert sin is not None
+            q_bthd, k_bthd = apply_rotary_pos_emb(q_bthd, k_bthd, cos, sin)
+
         if self.backend == AttnBackend.SDPA:
             # SDPA expects q,k,v as [B, H, T, d]
-            q_bhtd = qkv_bth3d[..., 0, :].permute(0, 2, 1, 3)
-            k_bhtd = qkv_bth3d[..., 1, :].permute(0, 2, 1, 3)
-            v_bhtd = qkv_bth3d[..., 2, :].permute(0, 2, 1, 3)
+            q_bhtd = q_bthd.permute(0, 2, 1, 3)
+            k_bhtd = k_bthd.permute(0, 2, 1, 3)
+            v_bhtd = v_bthd.permute(0, 2, 1, 3)
 
             out_bhtd = F.scaled_dot_product_attention(
                 q_bhtd, k_bhtd, v_bhtd, is_causal=is_causal, dropout_p=p
@@ -534,15 +554,14 @@ class AttentionAdapter(nn.Module):
 
         if self.backend == AttnBackend.FLASH3:
             # FlashAttn expects q,k,v as [B, T, H, d]
-            q_bthd = qkv_bth3d[..., 0, :].contiguous()
-            k_bthd = qkv_bth3d[..., 1, :].contiguous()
-            v_bthd = qkv_bth3d[..., 2, :].contiguous()
-
-            out_bthd = self._flash_attn_func(q_bthd, k_bthd, v_bthd, dropout_p=p, causal=is_causal)
+            out_bthd = self._flash_attn_func(
+                q_bthd.contiguous(), k_bthd.contiguous(), v_bthd.contiguous(),
+                dropout_p=p, causal=is_causal,
+            )
             return out_bthd.reshape(B, T, K, N, d)
 
         # FLASH3_QKVPACKED: qkvpacked is [B, T, 3, H, d]
-        qkvpacked_bt3hd = qkv_bth3d.permute(0, 1, 3, 2, 4).contiguous()
+        qkvpacked_bt3hd = torch.stack((q_bthd, k_bthd, v_bthd), dim=2).contiguous()  # [B,T,3,H,d]
         out_bthd = self._flash_qkvpacked_func(qkvpacked_bt3hd, dropout_p=p, causal=is_causal)
         return out_bthd.reshape(B, T, K, N, d)
 
@@ -573,6 +592,10 @@ class Morpher(nn.Module):
         head_input_scope: HeadInputScope = HeadInputScope.SLOT,
         attn_backend: AttnBackend = AttnBackend.SDPA,
         dropout: float = 0.0,
+        # --- RoPE config ---
+        use_rope: bool = True,
+        max_position_embeddings: int = 2048,
+        rope_base: int = 10000,
     ):
         super().__init__()
 
@@ -594,6 +617,8 @@ class Morpher(nn.Module):
 
         # d = slot feature width
         self.d = d
+        if use_rope:
+            assert self.d % 2 == 0, "RoPE requires even head_dim (d)"
 
         # N = number of streams (also the phase period)
         self.N = lcm_list(self.time_scales)
@@ -641,6 +666,17 @@ class Morpher(nn.Module):
 
         # Attention backend adapter
         self.attn = AttentionAdapter(attn_backend)
+
+        # --- Rotary positional embedding (RoPE) ---
+        self.use_rope = bool(use_rope)
+        self.rope = None
+        if self.use_rope:
+            # Cached cos/sin buffers sized to max_position_embeddings.
+            self.rope = RotaryEmbedding(
+                dim=self.d,
+                max_position_embeddings=int(max_position_embeddings),
+                base=int(rope_base),
+            )
 
         self.reset_parameters()
 
@@ -716,7 +752,23 @@ class Morpher(nn.Module):
             )
 
         # ---- 4) Attention over streams/scales
-        out_btknd = self.attn(qkv_btk_n3d, is_causal=is_causal, dropout_p=self.dropout_p)  # [B, T, K, N, d]
+        # RoPE cos/sin: [T, d] (slice from cached buffers)
+        cos = sin = None
+        if self.use_rope:
+            assert self.rope is not None
+            cos_full, sin_full = self.rope()          # [max_pos, d]
+            # NOTE: this applies RoPE based on absolute token index 0..T-1.
+            # If you want micro-step-dependent offset, slice with (t_offset:t_offset+T) instead.
+            cos = cos_full[:T]
+            sin = sin_full[:T]
+
+        out_btknd = self.attn(
+            qkv_btk_n3d,
+            is_causal=is_causal,
+            dropout_p=self.dropout_p,
+            cos=cos,
+            sin=sin,
+        )  # [B, T, K, N, d]
         out_btknd = self.dropout_attn(out_btknd)
 
         # Residual on active slots
