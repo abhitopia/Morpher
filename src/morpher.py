@@ -494,10 +494,9 @@ class AttentionAdapter(nn.Module):
             self._flash_attn_func = flash_attn_func
             self._flash_qkvpacked_func = flash_attn_qkvpacked_func
 
-    @staticmethod
-    def _effective_dropout_p(p: float, training: bool) -> float:
+    def _effective_dropout_p(self, p: float) -> float:
         # Match SDPA/FlashAttn conventions: dropout only when training *and* grads enabled.
-        return p if (training and torch.is_grad_enabled()) else 0.0
+        return p if (self.training and torch.is_grad_enabled()) else 0.0
 
     def forward(
         self,
@@ -511,7 +510,7 @@ class AttentionAdapter(nn.Module):
         d = three_d // 3
         H = K * N
 
-        p = self._effective_dropout_p(dropout_p, self.training)
+        p = self._effective_dropout_p(dropout_p)
 
         # Flatten heads (k,n) -> h in scale-major order: h = k*N + n
         # [B, T, K, N, 3d] -> [B, T, H, 3d]
