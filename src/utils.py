@@ -1,9 +1,17 @@
+from functools import reduce
 import math
-from typing import Tuple
+from typing import List, Tuple
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+def lcm(a: int, b: int) -> int:
+    return a * b // math.gcd(a, b)
+
+
+def lcm_list(xs: List[int]) -> int:
+    return reduce(lcm, xs, 1)
 
 def _find_multiple(a: int, b: int) -> int:
     """
@@ -190,3 +198,23 @@ class RotaryEmbedding(nn.Module):
     def forward(self):
         return self.cos_cached, self.sin_cached
 
+
+class Dropout(nn.Module):
+    """
+    Dropout active only when:
+      - module.training == True
+      - torch.is_grad_enabled() == True (disabled under no_grad/inference_mode)
+    """
+
+    def __init__(self, p: float = 0.0):
+        super().__init__()
+        if not (0.0 <= p <= 1.0):
+            raise ValueError(f"p must be in [0,1], got {p}")
+        self.p = float(p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.p == 0.0:
+            return x
+        if not (self.training and torch.is_grad_enabled()):
+            return x
+        return F.dropout(x, p=self.p, training=True)

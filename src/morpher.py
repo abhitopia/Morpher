@@ -1,47 +1,12 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Tuple
 from enum import StrEnum
-from math import gcd
-from functools import reduce
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import NoParamRMSNorm, CastedLinear, SwiGLU, trunc_normal_init_
-
-
-# -----------------------------
-# Utilities
-# -----------------------------
-def lcm(a: int, b: int) -> int:
-    return a * b // gcd(a, b)
-
-
-def lcm_list(xs: List[int]) -> int:
-    return reduce(lcm, xs, 1)
-
-
-class Dropout(nn.Module):
-    """
-    Dropout active only when:
-      - module.training == True
-      - torch.is_grad_enabled() == True (disabled under no_grad/inference_mode)
-    """
-
-    def __init__(self, p: float = 0.0):
-        super().__init__()
-        if not (0.0 <= p <= 1.0):
-            raise ValueError(f"p must be in [0,1], got {p}")
-        self.p = float(p)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.p == 0.0:
-            return x
-        if not (self.training and torch.is_grad_enabled()):
-            return x
-        return F.dropout(x, p=self.p, training=True)
+from utils import NoParamRMSNorm, CastedLinear, SwiGLU, trunc_normal_init_, Dropout, lcm_list
 
 
 # -----------------------------
@@ -159,14 +124,70 @@ class HeadInputScope(StrEnum):
     SCALES = "scales"
 
 
+
+# =============================================================================
+# Phase tables (init-time only)
+# =============================================================================
+class PhaseTables(nn.Module):
+    """
+    Owns all precomputed tables:
+      active_slots[phase, k] -> which slot index is active for scale k at phase
+      perm[phase, k, stream] -> head id used by that stream (stream->head)
+      invperm[phase, k, head] -> stream that should feed that head (head->stream)
+    """
+    active_slots: torch.Tensor
+    perm: torch.Tensor
+    invperm: torch.Tensor
+
+    def __init__(self, time_scales: List[int], assignment: StreamHeadAssignment):
+        super().__init__()
+        time_scales = sorted(time_scales)
+        assert time_scales[0] == 1, "include scale=1 as fastest"
+
+        self.time_scales = time_scales
+        self.K = len(time_scales)
+        self.N = lcm_list(time_scales)
+
+        self.register_buffer("active_slots", self._build_active_slots(), persistent=False)
+        perm, inv = self._build_perms(assignment)
+        self.register_buffer("perm", perm, persistent=False)
+        self.register_buffer("invperm", inv, persistent=False)
+
+    def _build_active_slots(self) -> torch.Tensor:
+        active = torch.empty(self.N, self.K, dtype=torch.long)
+        for phase in range(self.N):
+            off = 0
+            for k, s in enumerate(self.time_scales):
+                active[phase, k] = off + (phase % s)
+                off += s
+        return active  # [N, K]
+
+    def _build_perms(self, assignment: StreamHeadAssignment) -> Tuple[torch.Tensor, torch.Tensor]:
+        perm = torch.empty(self.N, self.K, self.N, dtype=torch.long)
+        inv  = torch.empty(self.N, self.K, self.N, dtype=torch.long)
+        stream_ids = torch.arange(self.N, dtype=torch.long)
+
+        for phase in range(self.N):
+            for k, s in enumerate(self.time_scales):
+                if assignment == StreamHeadAssignment.PRIVATE:
+                    p = stream_ids
+                else:
+                    alpha = self.N // s
+                    j = phase % s
+                    p = (stream_ids + alpha * j) % self.N
+
+                perm[phase, k] = p
+                inv_p = torch.empty_like(p)
+                inv_p[p] = stream_ids
+                inv[phase, k] = inv_p
+
+        return perm, inv  # each [N, K, N]
+
+
 # -----------------------------
 # Morpher
 # -----------------------------
 class Morpher(nn.Module):
-    # Type annotations for registered buffers to help mypy
-    active_slots: torch.Tensor
-    perm_within_scale: torch.Tensor
-    invperm_within_scale: torch.Tensor
 
     def __init__(
         self,
@@ -240,8 +261,7 @@ class Morpher(nn.Module):
             128 * 1024 * 1024
         )  # 128MB default (safe for most cases)
 
-        self._build_active_slots_table()
-        self._build_permutation_tables()
+        self.phase_tables = PhaseTables(self.time_scales, self.stream_head_assignment)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -255,61 +275,6 @@ class Morpher(nn.Module):
     # -----------------------------
     # Tables
     # -----------------------------
-    def _build_active_slots_table(self):
-        active_slots = torch.empty(self.N, self.K, dtype=torch.long)
-        for phase in range(self.N):
-            slot_offset = 0
-            for scale_idx, scale in enumerate(self.time_scales):
-                active_slots[phase, scale_idx] = slot_offset + (phase % scale)
-                slot_offset += scale
-        self.register_buffer("active_slots", active_slots, persistent=False)  # [N,K]
-
-    def _build_permutation_tables(self):
-        """
-        For each phase and scale:
-          perm[phase, k, stream] = head_id within scale (0..N-1) used by that stream
-          inv [phase, k, head]   = stream index that should feed that head
-        PRIVATE => identity.
-        """
-        # Initialize permutation tables:
-        # perm[phase, scale_idx, stream_id] -> head_id within scale that this stream uses
-        # inv[phase, scale_idx, head_id] -> stream_id that feeds this head
-        perm = torch.empty(self.N, self.K, self.N, dtype=torch.long)
-        inv = torch.empty(self.N, self.K, self.N, dtype=torch.long)
-
-        # Base stream indices [0, 1, 2, ..., N-1]
-        stream_ids = torch.arange(self.N, dtype=torch.long)
-
-        # For each phase in the cycle (0 to N-1)
-        for phase in range(self.N):
-            # For each scale k and its period s (e.g., s=1,2,4,8)
-            for k, s in enumerate(self.time_scales):
-                # j = current position within this scale's cycle (0 to s-1)
-                j = phase % s
-
-                if self.stream_head_assignment == StreamHeadAssignment.PRIVATE:
-                    # PRIVATE: Each stream gets its own dedicated head (identity mapping)
-                    # stream 0 -> head 0, stream 1 -> head 1, etc.
-                    p = stream_ids
-                else:
-                    # SHARED: Rotate streams within the scale based on phase
-                    # alpha = number of streams per head group within this scale
-                    alpha = self.N // s
-                    # Rotate streams by (alpha * j) positions to distribute across heads
-                    # This creates a cyclic assignment that changes with phase
-                    p = (stream_ids + alpha * j) % self.N
-
-                # Store the permutation: which head each stream uses
-                perm[phase, k] = p
-
-                # Build the inverse permutation: which stream feeds each head
-                inv_p = torch.empty_like(p)
-                inv_p[p] = stream_ids  # p maps stream->head, so inv_p[head] = stream
-                inv[phase, k] = inv_p
-
-        # Register as buffers (not saved in model checkpoints)
-        self.register_buffer("perm_within_scale", perm, persistent=False)  # [N,K,N]
-        self.register_buffer("invperm_within_scale", inv, persistent=False)  # [N,K,N]
 
     # -----------------------------
     # QKV projection helpers
@@ -389,8 +354,8 @@ class Morpher(nn.Module):
             return self._pack_qkv_for_sdpa(q_head, k_head, v_head, B, T, N, K, d)
 
         # SHARED wiring: permute streams -> heads and back
-        p: torch.Tensor = self.perm_within_scale[phase]  # [K,N] stream->head
-        inv: torch.Tensor = self.invperm_within_scale[phase]  # [K,N] head->stream
+        p: torch.Tensor = self.phase_tables.perm[phase]  # [K,N] stream->head
+        inv: torch.Tensor = self.phase_tables.invperm[phase]  # [K,N] head->stream
 
         # gather streams into HEAD order along dim=3 (stream axis)
         inv_idx = inv.view(1, 1, K, N, 1).expand(B, T, K, N, d)
@@ -445,7 +410,7 @@ class Morpher(nn.Module):
             # Build x_broadcast: [B,T,K,N,in_dim] (stream order) as a view (expand is cheap)
             x_b = x_in.unsqueeze(2).expand(B, T, K, N, in_dim)
 
-            inv: torch.Tensor = self.invperm_within_scale[phase]  # [K,N] head->stream
+            inv: torch.Tensor = self.phase_tables.invperm[phase]  # [K,N] head->stream
             inv_idx = inv.view(1, 1, K, N, 1).expand(B, T, K, N, in_dim)
 
             # Reorder streams -> head order for all scales at once
@@ -465,7 +430,7 @@ class Morpher(nn.Module):
             q_head, k_head, v_head = qkv.split(d, dim=-1)  # [B,T,K,N,d] head order
 
             # Route head -> stream: for each stream position s choose head p[k,s]
-            p: torch.Tensor = self.perm_within_scale[phase]  # [K,N] stream->head
+            p: torch.Tensor = self.phase_tables.perm[phase]  # [K,N] stream->head
             p_idx = p.view(1, 1, K, N, 1).expand(B, T, K, N, d)
 
             q_stream = torch.gather(
@@ -479,7 +444,7 @@ class Morpher(nn.Module):
         # ---------- SHARED fallback: per-scale loop (memory-safe) ----------
         q_list, k_list, v_list = [], [], []
         for k_idx in range(K):
-            inv_k: torch.Tensor = self.invperm_within_scale[phase, k_idx]  # [N] head->stream
+            inv_k: torch.Tensor = self.phase_tables.invperm[phase, k_idx]  # [N] head->stream
             x_head_k = x_in.index_select(
                 dim=2, index=inv_k
             )  # [B,T,N,in_dim] head order
@@ -494,7 +459,7 @@ class Morpher(nn.Module):
             q_head, k_head, v_head = qkv.split(d, dim=-1)  # [B,T,N,d] head order
 
             # Route back to stream order
-            p_k: torch.Tensor = self.perm_within_scale[phase, k_idx]  # [N] stream->head
+            p_k: torch.Tensor = self.phase_tables.perm[phase, k_idx]  # [N] stream->head
             q_stream = q_head.index_select(dim=2, index=p_k)
             k_stream = k_head.index_select(dim=2, index=p_k)
             v_stream = v_head.index_select(dim=2, index=p_k)
@@ -519,7 +484,7 @@ class Morpher(nn.Module):
         assert N == self.N and D == self.D
 
         phase = t % self.N
-        active_slots: torch.Tensor = self.active_slots[phase]  # [K]
+        active_slots: torch.Tensor = self.phase_tables.active_slots[phase]  # [K]
 
         # Mixer
         z_head = z + self.dropout_mixer(self.mixer(self.ln_mixer(z)))  # [B,T,N,D]
