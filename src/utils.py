@@ -185,6 +185,8 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings, base, device=None):
         super().__init__()
 
+        assert dim % 2 == 0, "RotaryEmbedding requires even dim"
+
         # RoPE
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float32, device=device)
