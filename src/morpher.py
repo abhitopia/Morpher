@@ -126,15 +126,24 @@ class StreamLoRAEncoder(nn.Module):
         return base_btd.unsqueeze(2) + self.enc_beta * delta_btnd       # [B, T, N, D]
 
 
-class StreamLoRADecoder(nn.Module):
+class StreamWiseDecoder(nn.Module):
     """
-    Decode multi-stream state back to output.
+    Decode multi-stream state back to output with higher bandwidth than the
+    current global bottleneck.
 
     Input:
-      z_btnd : [B, T, N, input_dim]
+      z_btnd : [B, T, N, D]
 
     Output:
-      y_bto : [B, T, output_dim]
+      y_bto  : [B, T, out_dim]
+
+    Design:
+      - Normalize per-stream over D (not over N*D).
+      - Compress each stream independently: D -> r (shared weights).
+      - Concatenate all stream summaries: [B, T, N*r]
+      - Final readout: (N*r) -> out_dim
+
+    This preserves N*r "bandwidth" into the final output instead of r.
     """
 
     def __init__(
@@ -152,10 +161,14 @@ class StreamLoRADecoder(nn.Module):
         self.output_dim = output_dim
         self.rank = rank
 
-        flat_in = self.N * self.input_dim
-        self.ln = NoParamRMSNorm(flat_in) if use_layernorm else nn.Identity()
-        self.proj_down = CastedLinear(flat_in, rank, bias=bias)
-        self.proj_up = CastedLinear(rank, output_dim, bias=bias)
+        # Normalize over per-stream feature dim D
+        self.ln = NoParamRMSNorm(input_dim) if use_layernorm else nn.Identity()
+
+        # Shared per-stream compression: D -> r
+        self.proj_down = CastedLinear(input_dim, rank, bias=bias)
+
+        # Final readout: (N*r) -> out_dim
+        self.proj_up = CastedLinear(num_splits * rank, output_dim, bias=bias)
 
         self.reset_parameters()
 
@@ -167,10 +180,17 @@ class StreamLoRADecoder(nn.Module):
         B, T, N, D = z_btnd.shape
         assert N == self.N and D == self.input_dim
 
-        z_flat_bt_i = z_btnd.reshape(B, T, N * D)        # [B, T, N*D]
-        h_btr = self.proj_down(self.ln(z_flat_bt_i))     # [B, T, r]
-        return self.proj_up(h_btr)                       # [B, T, out_dim]
+        # Normalize per stream: [B,T,N,D]
+        z = self.ln(z_btnd)
 
+        # Per-stream compression using shared weights: [B,T,N,r]
+        h_btnr = self.proj_down(z)
+
+        # Flatten stream summaries: [B,T,N*r]
+        h_bti = h_btnr.reshape(B, T, N * self.rank)
+
+        # Final readout: [B,T,out_dim]
+        return self.proj_up(h_bti)
 
 # =============================================================================
 # Enums
@@ -631,7 +651,7 @@ class Morpher(nn.Module):
 
         # Encoder / Decoder
         self.encoder = StreamLoRAEncoder(io_dim, self.D, self.N, enc_dec_rank)
-        self.decoder = StreamLoRADecoder(self.N, self.D, io_dim, enc_dec_rank)
+        self.decoder = StreamWiseDecoder(self.N, self.D, io_dim, enc_dec_rank)
 
         # Mixer (per-stream MLP over full state)
         self.mixer_expansion = mixer_expansion
