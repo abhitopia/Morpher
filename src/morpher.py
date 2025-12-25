@@ -15,7 +15,7 @@ from utils import (
 
 """
 ================================================================================
-Morpher (refactored)
+Morpher
 ================================================================================
 
 High-level idea
@@ -806,7 +806,7 @@ class Morpher(nn.Module):
         t = 0
         if burn_cycles > 0:
             # Burn-in without graph (fast + low memory)
-            with torch.inference_mode():
+            with torch.no_grad(): # inference_mode() is causes problem with torch.compile
                 for _ in range(burn_cycles):
                     z_btnd = self.forward_cycle(z_btnd, t0=t, is_causal=is_causal)
                     t += self.N
@@ -858,5 +858,6 @@ if __name__ == "__main__":
     # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
     #     y = model(x, R=4, is_causal=True, grad_cycles=1)
 
+    model = torch.compile(model)
     y = model(x, R=2, is_causal=True, grad_cycles=1)
     print("x:", x.shape, "y:", y.shape)
