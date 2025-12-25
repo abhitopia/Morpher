@@ -20,11 +20,7 @@ from pathlib import Path
 
 # Add paths for imports
 REPO_ROOT = Path(__file__).parent
-SRC_DIR = REPO_ROOT / "src"
-HRM_DIR = REPO_ROOT / "external" / "HRM"
 
-sys.path.insert(0, str(SRC_DIR))
-sys.path.insert(0, str(HRM_DIR))
 
 from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
@@ -132,7 +128,7 @@ LOSS_CLASSES = {
 def create_model(config: TrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
     """Create Morpher model with loss head."""
     
-    model_cfg = dict(
+    model_cfg = MorpherWrapperConfig(
         **config.arch.__pydantic_extra__,  # type: ignore
         batch_size=config.global_batch_size // world_size,
         vocab_size=train_metadata.vocab_size,
