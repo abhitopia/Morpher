@@ -4,6 +4,13 @@ version = "0.1.0"
 description = "Morpher computation block"
 authors = ["Abhi <abhi@abhitopia.me>"]
 readme = "README.md"
+packages = [
+    { include = "morpher.py", from = "src" },
+    { include = "morpher_wrapper.py", from = "src" },
+    { include = "utils.py", from = "src" },
+    { include = "models", from = "external/HRM" },
+    { include = "utils", from = "external/HRM" },
+]
 
 [tool.poetry.dependencies]
 python = ">=3.12,<3.15"
