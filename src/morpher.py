@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from enum import StrEnum
 from typing import List, Tuple
 
@@ -85,7 +86,10 @@ class StreamLoRAEncoder(nn.Module):
 
     Structure:
       base(x) is shared across streams
-      delta(x) is stream-specific LoRA (A shared, B per-stream)
+      delta(x) is stream-specific LoRA (both A and B per-stream)
+      
+    Each stream operates as an independent hypothesis with its own
+    feature extraction (A) and mapping (B).
     """
 
     def __init__(self, input_dim: int, output_dim: int, num_splits: int, rank: int):
@@ -95,9 +99,12 @@ class StreamLoRAEncoder(nn.Module):
         self.N = num_splits
         self.rank = rank
 
-        self.enc_base = CastedLinear(input_dim, output_dim, bias=False)  # shared
-        self.enc_A = CastedLinear(input_dim, rank, bias=False)          # shared
-
+        # Shared base projection
+        self.enc_base = CastedLinear(input_dim, output_dim, bias=False)
+        
+        # Per-stream LoRA A: [N, input_dim, r]
+        self.enc_A = nn.Parameter(torch.empty(num_splits, input_dim, rank))
+        
         # Per-stream LoRA B: [N, r, D]
         self.enc_B = nn.Parameter(torch.zeros(num_splits, rank, output_dim))
 
@@ -107,8 +114,10 @@ class StreamLoRAEncoder(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        self.enc_base.reset_parameters()  # CastedLinear uses trunc_normal_init_
-        self.enc_A.reset_parameters()     # CastedLinear uses trunc_normal_init_
+        self.enc_base.reset_parameters()
+        # Initialize per-stream A with truncated normal
+        for n in range(self.N):
+            nn.init.trunc_normal_(self.enc_A[n], std=1.0 / (self.input_dim ** 0.5))
         nn.init.zeros_(self.enc_B)
         with torch.no_grad():
             self.enc_beta.fill_(0.01)
@@ -117,85 +126,21 @@ class StreamLoRAEncoder(nn.Module):
         B, T, _ = x_bti.shape
 
         base_btd = self.enc_base(x_bti)   # [B, T, D]
-        h_btr = self.enc_A(x_bti)         # [B, T, r]
-
-        # Compute delta for each stream via batched GEMM:
-        #   delta[:,:,n,:] = h @ B[n]
-        #
-        # Efficient grouping: bmm over N "batches"
-        h_bt_r = h_btr.reshape(B * T, self.rank)                        # [BT, r]
-        h_n_bt_r = h_bt_r.unsqueeze(0).expand(self.N, B * T, self.rank) # [N, BT, r]
-        delta_n_bt_d = torch.bmm(h_n_bt_r, self.enc_B)                  # [N, BT, D]
+        
+        # Per-stream low-rank projection via batched GEMM:
+        #   h[:,:,n,:] = x @ A[n]
+        x_bt_i = x_bti.reshape(B * T, self.input_dim)                     # [BT, input_dim]
+        x_n_bt_i = x_bt_i.unsqueeze(0).expand(self.N, B * T, self.input_dim)  # [N, BT, input_dim]
+        h_n_bt_r = torch.bmm(x_n_bt_i, self.enc_A)                        # [N, BT, r]
+        
+        # Per-stream expansion via batched GEMM:
+        #   delta[:,:,n,:] = h[:,:,n,:] @ B[n]
+        delta_n_bt_d = torch.bmm(h_n_bt_r, self.enc_B)                    # [N, BT, D]
 
         delta_btnd = delta_n_bt_d.permute(1, 0, 2).reshape(B, T, self.N, self.output_dim)
-        return base_btd.unsqueeze(2) + self.enc_beta * delta_btnd       # [B, T, N, D]
+        
+        return base_btd.unsqueeze(2) + self.enc_beta * delta_btnd         # [B, T, N, D]
 
-
-class StreamWiseDecoder(nn.Module):
-    """
-    Decode multi-stream state back to output with higher bandwidth than the
-    current global bottleneck.
-
-    Input:
-      z_btnd : [B, T, N, D]
-
-    Output:
-      y_bto  : [B, T, out_dim]
-
-    Design:
-      - Normalize per-stream over D (not over N*D).
-      - Compress each stream independently: D -> r (shared weights).
-      - Concatenate all stream summaries: [B, T, N*r]
-      - Final readout: (N*r) -> out_dim
-
-    This preserves N*r "bandwidth" into the final output instead of r.
-    """
-
-    def __init__(
-        self,
-        num_splits: int,
-        input_dim: int,
-        output_dim: int,
-        rank: int,
-        use_layernorm: bool = True,
-        bias: bool = False,
-    ):
-        super().__init__()
-        self.N = num_splits
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.rank = rank
-
-        # Normalize over per-stream feature dim D
-        self.ln = NoParamRMSNorm(input_dim) if use_layernorm else nn.Identity()
-
-        # Shared per-stream compression: D -> r
-        self.proj_down = CastedLinear(input_dim, rank, bias=bias)
-
-        # Final readout: (N*r) -> out_dim
-        self.proj_up = CastedLinear(num_splits * rank, output_dim, bias=bias)
-
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        self.proj_down.reset_parameters()
-        self.proj_up.reset_parameters()
-
-    def forward(self, z_btnd: torch.Tensor) -> torch.Tensor:
-        B, T, N, D = z_btnd.shape
-        assert N == self.N and D == self.input_dim
-
-        # Normalize per stream: [B,T,N,D]
-        z = self.ln(z_btnd)
-
-        # Per-stream compression using shared weights: [B,T,N,r]
-        h_btnr = self.proj_down(z)
-
-        # Flatten stream summaries: [B,T,N*r]
-        h_bti = h_btnr.reshape(B, T, N * self.rank)
-
-        # Final readout: [B,T,out_dim]
-        return self.proj_up(h_bti)
 
 # =============================================================================
 # Enums
@@ -669,6 +614,113 @@ class CrossStreamAttention(nn.Module):
 
 
 # =============================================================================
+# Stream Attention Decoder
+# =============================================================================
+class StreamAttentionDecoder(nn.Module):
+    """
+    Decode multi-stream state to output using:
+      - Residual rank projection per stream:  D -> r
+      - Cross-stream attention (mix hypotheses): D -> r
+      - Stream-dependent gating on the attention branch
+      - Concat + SwiGLU MLP + final projection
+
+    Input:
+      z_btnd : [B, T, N, D]  (final stream state)
+
+    Output:
+      y_bto  : [B, T, out_dim]
+    """
+
+    def __init__(
+        self,
+        num_streams: int,      # N
+        stream_dim: int,       # D
+        output_dim: int,       # out_dim
+        rank: int,             # r (per-stream intermediate dim)
+        attn_dim: int,         # Q/K dimension for cross-stream attention
+        mlp_expansion: float,
+        dropout: float,
+        backend: AttnBackend,
+        attn_gate_init: float,  # initial sigmoid(gate) per stream
+    ):
+        super().__init__()
+        self.N = num_streams
+        self.stream_dim = stream_dim
+        self.output_dim = output_dim
+        self.rank = rank
+
+        # Stage 1: normalize state before both residual projection and attention
+        self.ln_attn = NoParamRMSNorm(stream_dim)
+
+        # Residual projection in rank space: [B,T,N,D] -> [B,T,N,r]
+        self.res_proj = CastedLinear(stream_dim, rank, bias=False)
+
+        # Cross-stream attention: [B,T,N,D] -> [B,T,N,r]
+        self.cross_attn = CrossStreamAttention(
+            stream_dim=stream_dim,
+            attn_dim=attn_dim,
+            out_dim=rank,
+            dropout=dropout,
+            backend=backend,
+        )
+
+        # Stream-dependent gate on attention branch (breaks symmetry intentionally)
+        # alpha_n = sigmoid(logit_n) in (0, 1)
+        attn_gate_init = float(attn_gate_init)
+        if not (0.0 < attn_gate_init < 1.0):
+            raise ValueError("attn_gate_init must be in (0, 1).")
+        self._attn_gate_init = attn_gate_init
+        self.alpha_attn_logit = nn.Parameter(torch.empty(num_streams))
+
+        # Stage 2: SwiGLU MLP with residual
+        concat_dim = num_streams * rank  # N * r
+        self.ln_mlp = NoParamRMSNorm(concat_dim)
+        self.mlp = SwiGLU(concat_dim, expansion=mlp_expansion)
+
+        # Stage 3: Final projection
+        self.proj_out = CastedLinear(concat_dim, output_dim, bias=False)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        self.res_proj.reset_parameters()
+        self.cross_attn.reset_parameters()
+        self.mlp.reset_parameters()
+        self.proj_out.reset_parameters()
+        # Initialize gate logits from attn_gate_init
+        init_logit = math.log(self._attn_gate_init / (1.0 - self._attn_gate_init))
+        with torch.no_grad():
+            self.alpha_attn_logit.fill_(init_logit)
+
+    def forward(self, z_btnd: torch.Tensor) -> torch.Tensor:
+        B, T, N, D = z_btnd.shape
+        assert N == self.N and D == self.stream_dim
+
+        # Normalize once and share for both branches
+        z_norm = self.ln_attn(z_btnd)  # [B,T,N,D]
+
+        # Branch A (residual content path): per-stream projection to rank space
+        h_res = self.res_proj(z_norm)  # [B,T,N,r]
+
+        # Branch B (mixing path): cross-stream attention in rank space
+        h_attn = self.cross_attn(z_norm)  # [B,T,N,r]
+
+        # Stream-dependent gate on the mixing branch
+        alpha = torch.sigmoid(self.alpha_attn_logit).view(1, 1, N, 1)  # [1,1,N,1]
+        h = h_res + alpha * h_attn  # [B,T,N,r]
+
+        # Concatenate across streams: [B, T, N*r]
+        h_cat = h.reshape(B, T, -1)
+
+        # SwiGLU MLP with residual
+        h_mlp = h_cat + self.mlp(self.ln_mlp(h_cat))
+
+        # Final projection: [B, T, out_dim]
+        return self.proj_out(h_mlp)
+
+
+
+# =============================================================================
 # Morpher
 # =============================================================================
 class Morpher(nn.Module):
@@ -701,7 +753,9 @@ class Morpher(nn.Module):
         # --- Global slot config ---
         use_global_slot: bool = False,
         global_slot_scale: int | None = None,
-        global_attn_dim: int | None = None,
+        # --- Cross-stream attention config (used by decoder and global slot) ---
+        cross_attn_kq_dim: int | None = None,  # Q/K dim for cross-stream attention
+        cross_attn_gate_init: float = 0.01,       # Initial gate value for cross-stream attention
     ):
         super().__init__()
 
@@ -710,6 +764,7 @@ class Morpher(nn.Module):
         assert stream_head_assignment in StreamHeadAssignment
         assert head_input_scope in HeadInputScope
 
+        self.cross_attn_gate_init = cross_attn_gate_init
         self.time_scales = time_scales
         self.stream_head_assignment = stream_head_assignment
         self.head_input_scope = head_input_scope
@@ -746,7 +801,17 @@ class Morpher(nn.Module):
 
         # Encoder / Decoder
         self.encoder = StreamLoRAEncoder(io_dim, self.D, self.N, enc_dec_rank)
-        self.decoder = StreamWiseDecoder(self.N, self.D, io_dim, enc_dec_rank)
+        self.decoder = StreamAttentionDecoder(
+            num_streams=self.N,
+            stream_dim=self.D,
+            output_dim=io_dim,
+            rank=enc_dec_rank,
+            attn_dim=cross_attn_kq_dim if cross_attn_kq_dim is not None else enc_dec_rank,
+            mlp_expansion=mixer_expansion,
+            dropout=dropout,
+            backend=attn_backend,
+            attn_gate_init=cross_attn_gate_init,
+        )
 
         # Mixer (per-stream MLP over full state)
         self.mixer_expansion = mixer_expansion
@@ -794,9 +859,10 @@ class Morpher(nn.Module):
         # --- Global slot cross-stream attention (if enabled) ---
         if self.use_global_slot:
             self.ln_global = NoParamRMSNorm(self.D)
+            self.global_alpha_logit = nn.Parameter(torch.empty(self.N))
             self.cross_stream_attn = CrossStreamAttention(
                 stream_dim=self.D,
-                attn_dim=global_attn_dim if global_attn_dim is not None else self.d,
+                attn_dim=cross_attn_kq_dim if cross_attn_kq_dim is not None else self.d,
                 out_dim=self.d,  # Output fits in one slot
                 dropout=dropout,
                 backend=attn_backend,
@@ -811,6 +877,9 @@ class Morpher(nn.Module):
         self.projector.reset_parameters()
         if self.use_global_slot:
             self.cross_stream_attn.reset_parameters()
+            init_logit = math.log(self.cross_attn_gate_init / (1.0 - self.cross_attn_gate_init))
+            with torch.no_grad():
+                self.global_alpha_logit.fill_(init_logit)
 
     # -------------------------------------------------------------------------
     # One micro-step
@@ -922,7 +991,9 @@ class Morpher(nn.Module):
         # Extract current global slot and add residual
         z_slots = z_btnd.view(B, T, N, self.S, self.d)
         old_global = z_slots[:, :, :, self.global_slot_idx, :]  # [B, T, N, d]
-        new_global = old_global + global_update
+
+        alpha = torch.sigmoid(self.global_alpha_logit).view(1, 1, self.N, 1)  # [1,1,N,1]
+        new_global = old_global + alpha * global_update
         
         # Write back
         z_next = z_btnd.clone()
@@ -964,8 +1035,8 @@ class Morpher(nn.Module):
         assert 1 <= grad_cycles <= R
         burn_cycles = R - grad_cycles
 
-        # Encoder must have grad so stacking works
-        z0_btnd = self.encoder(x_bti)  # [B, T, N, D] with grad
+        # Encoder
+        z0_btnd = self.encoder(x_bti)  # [B, T, N, D]
         z_btnd = z0_btnd.detach()
 
         t = 0

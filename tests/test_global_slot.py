@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from morpher import Morpher, StreamHeadAssignment, HeadInputScope, AttnBackend, CrossStreamAttention
 
-def _make_model(use_global_slot=True, global_slot_scale=4, d=8, N=4):
+def _make_model(use_global_slot=True, global_slot_scale=4, d=8, N=4, cross_attn_gate_init=0.99):
     """Factory for tests."""
     # time_scales=[1, 2, 4] -> N=4 (lcm)
     return Morpher(
@@ -16,6 +16,7 @@ def _make_model(use_global_slot=True, global_slot_scale=4, d=8, N=4):
         use_global_slot=use_global_slot,
         global_slot_scale=global_slot_scale,
         attn_backend=AttnBackend.SDPA,
+        cross_attn_gate_init=cross_attn_gate_init,
     )
 
 def test_cross_stream_attention_shapes():
@@ -145,14 +146,16 @@ def test_global_slot_updates_at_correct_frequency():
     assert torch.all(z_slots_t1[..., -1, :] == 0), "Global slot changed at t=1 but shouldn't have"
     
     # t=0 (update expected)
-    # with our mock, it adds fixed_val
+    # with our mock, it adds fixed_val scaled by the gate
     z_out_t0 = model.step(z_in, t=0, is_causal=True)
     z_slots_t0 = z_out_t0.view(2, 1, model.N, model.S, model.d)
     
-    # The value should be roughly fixed_val (plus residual which was 0)
-    # Note: _update_global_slot adds residual: new = old + update
-    # old was 0. update is 100. new should be 100.
-    assert torch.allclose(z_slots_t0[..., -1, :], torch.tensor(fixed_val)), "Global slot didn't update at t=0"
+    # The value should be gate * fixed_val (where gate ≈ 0.99 for our test config)
+    # old was 0. update is 100. new = 0 + gate * 100 ≈ 99
+    gate = torch.sigmoid(model.global_alpha_logit).mean().item()
+    expected = gate * fixed_val
+    assert torch.allclose(z_slots_t0[..., -1, :], torch.tensor(expected), rtol=0.01), \
+        f"Global slot didn't update correctly at t=0, expected ~{expected}"
 
 def test_gradient_flow_global_slot():
     """Verify gradients flow through global slot attention."""
@@ -218,8 +221,8 @@ def test_cross_stream_attention_different_dimensions():
 
 def test_global_slot_accumulation_across_updates():
     """
-    Verify global slot properly accumulates updates.
-    Each _update_global_slot call should add to the residual.
+    Verify global slot properly accumulates updates with gating.
+    Each _update_global_slot call should add gate * increment to the residual.
     """
     model = _make_model(use_global_slot=True, global_slot_scale=1, d=8)
     
@@ -237,10 +240,13 @@ def test_global_slot_accumulation_across_updates():
     for _ in range(num_updates):
         z = model._update_global_slot(z)
     
-    # Global slot should have accumulated: 0 + 1 + 1 + 1 = 3
+    # Get the gate value
+    gate = torch.sigmoid(model.global_alpha_logit).mean().item()
+    
+    # Global slot should have accumulated: 0 + gate*1 + gate*1 + gate*1 = 3*gate
     z_slots = z.view(B, T, model.N, model.S, model.d)
     global_slot = z_slots[..., -1, :]
     
-    expected_val = float(num_updates) * increment
-    assert torch.allclose(global_slot, torch.tensor(expected_val)), \
+    expected_val = float(num_updates) * increment * gate
+    assert torch.allclose(global_slot, torch.tensor(expected_val), rtol=0.01), \
         f"Expected global slot = {expected_val}, got {global_slot.mean().item()}"
