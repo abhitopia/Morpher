@@ -7,9 +7,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import (
-    NoParamRMSNorm, CastedLinear, SwiGLU, trunc_normal_init_, Dropout, lcm_list,
-    RotaryEmbedding, apply_rotary_pos_emb
+from utils import trunc_normal_init_, lcm_list
+from modules import (
+    NoParamRMSNorm,
+    CastedLinear,
+    SwiGLU,
+    Dropout,
+    RotaryEmbedding,
+    apply_rotary_pos_emb,
 )
 
 

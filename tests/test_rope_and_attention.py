@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from utils import RotaryEmbedding, apply_rotary_pos_emb, rotate_half
+from modules import RotaryEmbedding, apply_rotary_pos_emb, rotate_half
 from morpher import AttentionAdapter, AttnBackend
 
 
