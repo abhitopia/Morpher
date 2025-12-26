@@ -167,15 +167,12 @@ def test_flash3_matches_sdpa_no_dropout():
 
     sdpa = AttentionAdapter(AttnBackend.SDPA, rope=rope).cuda().eval()
     fl3 = AttentionAdapter(AttnBackend.FLASH3, rope=rope).cuda().eval()
-    fl3p = AttentionAdapter(AttnBackend.FLASH3_QKVPACKED, rope=rope).cuda().eval()
 
     qkv = torch.randn(B, T, K, N, 3*d, device="cuda", dtype=torch.float16)
 
     with torch.no_grad():
         y_sdpa = sdpa(qkv, is_causal=True, dropout_p=0.0)
         y_fl3 = fl3(qkv, is_causal=True, dropout_p=0.0)
-        y_fl3p = fl3p(qkv, is_causal=True, dropout_p=0.0)
 
     # tolerances for fp16
     assert torch.allclose(y_sdpa, y_fl3, atol=2e-2, rtol=2e-2)
-    assert torch.allclose(y_fl3, y_fl3p, atol=2e-2, rtol=2e-2)

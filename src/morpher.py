@@ -213,8 +213,7 @@ class HeadInputScope(StrEnum):
 
 class AttnBackend(StrEnum):
     SDPA = "sdpa"
-    FLASH3 = "flash3"                     # flash_attn_func(q,k,v) with q,k,v [B,T,H,d]
-    FLASH3_QKVPACKED = "flash3_qkvpacked" # flash_attn_qkvpacked_func(qkv) with qkv [B,T,3,H,d]
+    FLASH3 = "flash3"  # flash_attn_func(q, k, v) with q, k, v [B, T, H, d]
 
 
 # =============================================================================
@@ -508,19 +507,17 @@ class AttentionAdapter(nn.Module):
         self.backend = backend
         self.rope = rope
         self._flash_attn_func = None
-        self._flash_qkvpacked_func = None
 
-        if backend in (AttnBackend.FLASH3, AttnBackend.FLASH3_QKVPACKED):
+        if backend == AttnBackend.FLASH3:
             try:
-                from flash_attn import flash_attn_func, flash_attn_qkvpacked_func
-            except Exception as e:
+                from flash_attn import flash_attn_func
+            except ImportError as e:
                 raise ImportError(
-                    "Requested FlashAttention-3 backend but flash_attn is not importable. "
+                    "Requested FlashAttention backend but flash_attn is not importable. "
                     "Install flash-attn (and ensure you're on a supported CUDA setup), "
                     "or choose AttnBackend.SDPA."
                 ) from e
             self._flash_attn_func = flash_attn_func
-            self._flash_qkvpacked_func = flash_attn_qkvpacked_func
 
     def _effective_dropout_p(self, p: float) -> float:
         # Match SDPA/FlashAttn conventions: dropout only when training *and* grads enabled.
@@ -577,18 +574,98 @@ class AttentionAdapter(nn.Module):
             out_btknd = out_bkntd.permute(0, 3, 1, 2, 4)         # [B, T, K, N, d]
             return out_btknd
 
-        if self.backend == AttnBackend.FLASH3:
-            # FlashAttn expects q,k,v as [B, T, H, d]
-            out_bthd = self._flash_attn_func(
-                q_bthd.contiguous(), k_bthd.contiguous(), v_bthd.contiguous(),
-                dropout_p=p, causal=is_causal,
-            )
-            return out_bthd.reshape(B, T, K, N, d)
-
-        # FLASH3_QKVPACKED: qkvpacked is [B, T, 3, H, d]
-        qkvpacked_bt3hd = torch.stack((q_bthd, k_bthd, v_bthd), dim=2).contiguous()  # [B,T,3,H,d]
-        out_bthd = self._flash_qkvpacked_func(qkvpacked_bt3hd, dropout_p=p, causal=is_causal)
+        # FLASH3: FlashAttn expects q, k, v as [B, T, H, d]
+        out_bthd = self._flash_attn_func(
+            q_bthd.contiguous(), k_bthd.contiguous(), v_bthd.contiguous(),
+            dropout_p=p, causal=is_causal,
+        )
         return out_bthd.reshape(B, T, K, N, d)
+
+
+# =============================================================================
+# Cross-stream attention (for global slot)
+# =============================================================================
+class CrossStreamAttention(nn.Module):
+    """
+    Self-attention over N streams dimension.
+    
+    For each (b, t) position, streams attend to each other.
+    No positional encoding — streams are permutation-symmetric.
+    
+    Input:  z_btnd [B, T, N, D]
+    Output: h_btno [B, T, N, out_dim]
+    """
+    
+    def __init__(
+        self,
+        stream_dim: int,     # D (input dimension per stream)
+        attn_dim: int,       # d_head for Q/K
+        out_dim: int,        # output dimension (d for global slot)
+        dropout: float = 0.0,
+        backend: AttnBackend = AttnBackend.SDPA,
+    ):
+        super().__init__()
+        self.stream_dim = stream_dim
+        self.attn_dim = attn_dim
+        self.out_dim = out_dim
+        self.backend = backend
+        self.dropout_p = float(dropout)
+        
+        # Fused QKV projection: [stream_dim] -> [2*attn_dim + out_dim]
+        # Q and K have attn_dim, V has out_dim
+        self.W_qkv = CastedLinear(stream_dim, 2 * attn_dim + out_dim, bias=False)
+        
+        # FlashAttention imports (lazy)
+        self._flash_attn_func = None
+        if backend == AttnBackend.FLASH3:
+            try:
+                from flash_attn import flash_attn_func
+                self._flash_attn_func = flash_attn_func
+            except ImportError as e:
+                raise ImportError(
+                    "Requested FlashAttention backend but flash_attn is not importable. "
+                    "Install flash-attn or choose AttnBackend.SDPA."
+                ) from e
+        
+        self.reset_parameters()
+    
+    def reset_parameters(self) -> None:
+        self.W_qkv.reset_parameters()
+    
+    def _effective_dropout_p(self) -> float:
+        return self.dropout_p if (self.training and torch.is_grad_enabled()) else 0.0
+    
+    def forward(self, z_btnd: torch.Tensor) -> torch.Tensor:
+        """
+        z_btnd: [B, T, N, D]
+        returns: [B, T, N, out_dim]
+        """
+        B, T, N, D = z_btnd.shape
+        assert D == self.stream_dim
+        
+        # Fused QKV projection
+        qkv = self.W_qkv(z_btnd)  # [B, T, N, 2*attn_dim + out_dim]
+        Q, K, V = qkv.split([self.attn_dim, self.attn_dim, self.out_dim], dim=-1)
+        # Q, K: [B, T, N, attn_dim], V: [B, T, N, out_dim]
+        
+        p = self._effective_dropout_p()
+        
+        if self.backend == AttnBackend.SDPA:
+            # SDPA expects [Batch, Heads, SeqLen, Dim]
+            # Batch = B*T, Heads = 1, SeqLen = N
+            Q_ = Q.reshape(B * T, 1, N, self.attn_dim)
+            K_ = K.reshape(B * T, 1, N, self.attn_dim)
+            V_ = V.reshape(B * T, 1, N, self.out_dim)
+            
+            h_flat = F.scaled_dot_product_attention(Q_, K_, V_, dropout_p=p)
+        else:
+            # FlashAttention expects [Batch, SeqLen, Heads, Dim]
+            # Batch = B*T, SeqLen = N, Heads = 1
+            Q_ = Q.reshape(B * T, N, 1, self.attn_dim).contiguous()
+            K_ = K.reshape(B * T, N, 1, self.attn_dim).contiguous()
+            V_ = V.reshape(B * T, N, 1, self.out_dim).contiguous()
+            h_flat = self._flash_attn_func(Q_, K_, V_, dropout_p=p, causal=False)
+        return h_flat.reshape(B, T, N, self.out_dim)
 
 
 # =============================================================================
@@ -621,6 +698,10 @@ class Morpher(nn.Module):
         use_rope: bool = True,
         max_position_embeddings: int = 2048,
         rope_base: int = 10000,
+        # --- Global slot config ---
+        use_global_slot: bool = False,
+        global_slot_scale: int | None = None,
+        global_attn_dim: int | None = None,
     ):
         super().__init__()
 
@@ -646,10 +727,19 @@ class Morpher(nn.Module):
         self.N = lcm_list(self.time_scales)
 
         # S = total slots per stream (sum of scale periods)
-        self.S = sum(self.time_scales)
+        # If global slot is enabled, add one additional slot
+        self.use_global_slot = bool(use_global_slot)
+        base_S = sum(self.time_scales)
+        self.S = base_S + 1 if self.use_global_slot else base_S
 
         # D = stream state width
         self.D = self.S * self.d
+        
+        # Global slot configuration (if enabled)
+        if self.use_global_slot:
+            self.global_slot_idx = self.S - 1  # Last slot is global
+            self.global_slot_scale = global_slot_scale if global_slot_scale is not None else self.N
+            assert self.global_slot_scale >= 1, "global_slot_scale must be >= 1"
 
         # Precomputed phase tables
         self.tables = PhaseTables(self.time_scales, self.stream_head_assignment)
@@ -700,6 +790,18 @@ class Morpher(nn.Module):
 
         # Attention backend adapter
         self.attn = AttentionAdapter(attn_backend, rope=self.rope)
+        
+        # --- Global slot cross-stream attention (if enabled) ---
+        if self.use_global_slot:
+            self.ln_global = NoParamRMSNorm(self.D)
+            self.cross_stream_attn = CrossStreamAttention(
+                stream_dim=self.D,
+                attn_dim=global_attn_dim if global_attn_dim is not None else self.d,
+                out_dim=self.d,  # Output fits in one slot
+                dropout=dropout,
+                backend=attn_backend,
+            )
+        
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -707,6 +809,8 @@ class Morpher(nn.Module):
         self.decoder.reset_parameters()
         self.mixer.reset_parameters()
         self.projector.reset_parameters()
+        if self.use_global_slot:
+            self.cross_stream_attn.reset_parameters()
 
     # -------------------------------------------------------------------------
     # One micro-step
@@ -789,7 +893,43 @@ class Morpher(nn.Module):
         z_next_slots_btnsd = z_next_btnd.view(B, T, N, self.S, self.d)
         z_next_slots_btnsd.index_copy_(dim=3, index=active_slots_k, source=out_btnkd)
 
+        # ---- 6) Global slot update (if scheduled)
+        if self.use_global_slot and (t % self.global_slot_scale == 0):
+            z_next_btnd = self._update_global_slot(z_next_btnd)
+
         return z_next_btnd
+
+    # -------------------------------------------------------------------------
+    # Global slot update
+    # -------------------------------------------------------------------------
+    def _update_global_slot(self, z_btnd: torch.Tensor) -> torch.Tensor:
+        """
+        Update global slot via cross-stream attention.
+        
+        Input:
+          z_btnd : [B, T, N, D]
+        
+        Output:
+          z_updated_btnd : [B, T, N, D] with updated global slot
+        """
+        B, T, N, D = z_btnd.shape
+        assert (N, D) == (self.N, self.D)
+        
+        # Cross-stream attention over full state
+        z_norm = self.ln_global(z_btnd)                    # [B, T, N, D]
+        global_update = self.cross_stream_attn(z_norm)     # [B, T, N, d]
+        
+        # Extract current global slot and add residual
+        z_slots = z_btnd.view(B, T, N, self.S, self.d)
+        old_global = z_slots[:, :, :, self.global_slot_idx, :]  # [B, T, N, d]
+        new_global = old_global + global_update
+        
+        # Write back
+        z_next = z_btnd.clone()
+        z_next_slots = z_next.view(B, T, N, self.S, self.d)
+        z_next_slots[:, :, :, self.global_slot_idx, :] = new_global
+        
+        return z_next
 
     # -------------------------------------------------------------------------
     # Cycle update
@@ -870,7 +1010,7 @@ if __name__ == "__main__":
         mixer_expansion=mixer_expansion,
         stream_head_assignment=StreamHeadAssignment.PRIVATE,
         head_input_scope=HeadInputScope.SLOT,  # try STREAM / SCALES too
-        attn_backend=AttnBackend.SDPA,         # try FLASH3 / FLASH3_QKVPACKED if available
+        attn_backend=AttnBackend.SDPA,         # try FLASH3 if available
         dropout=0.1,
     )
 
