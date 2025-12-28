@@ -421,21 +421,39 @@ class ECABatchSampler(Sampler[List[Tuple[int, int]]]):
             if self.k_max_start > self.k_max:
                 raise ValueError(f"k_max_start ({self.k_max_start}) must be <= max(k_values) ({self.k_max})")
         
-        # Global batch counter for multi-epoch curriculum tracking
-        self._global_batch_idx = 0
+        # Epoch counter for curriculum tracking and shuffle seeding
+        self._epoch = 0
 
-    def _get_k_values_for_batch(self, batch_idx: int) -> List[int]:
-        """Get available k values for a given batch index based on curriculum."""
+    def set_epoch(self, epoch: int) -> None:
+        """Set epoch for curriculum tracking and shuffle seeding.
+        
+        Call this before each epoch for:
+        - Reproducible shuffling in distributed training
+        - Easy checkpoint resume
+        
+        If not called, the sampler auto-increments epoch at end of each iteration.
+        
+        Args:
+            epoch: Current epoch number (0-indexed)
+        """
+        self._epoch = int(epoch)
+
+    def _get_global_batch_idx(self, batch_within_epoch: int) -> int:
+        """Compute global batch index from epoch and batch within epoch."""
+        return self._epoch * len(self) + batch_within_epoch
+
+    def _get_k_values_for_batch(self, global_batch_idx: int) -> List[int]:
+        """Get available k values for a given global batch index based on curriculum."""
         # No curriculum: use all k_values immediately
         if self.ramp_batches == 0:
             return self.k_values
         
         # Before warmup: use k <= k_max_start
-        if batch_idx < self.warmup_batches:
+        if global_batch_idx < self.warmup_batches:
             return [k for k in self.k_values if k <= self.k_max_start]
         
         # After ramp: use all k_values
-        progress_batch = batch_idx - self.warmup_batches
+        progress_batch = global_batch_idx - self.warmup_batches
         if progress_batch >= self.ramp_batches:
             return self.k_values
         
@@ -447,23 +465,24 @@ class ECABatchSampler(Sampler[List[Tuple[int, int]]]):
         return [k for k in self.k_values if k <= current_k_max]
 
     def __iter__(self) -> Iterator[List[Tuple[int, int]]]:
-        # Deterministic permutation of indices (re-seeded each epoch for different shuffle)
+        # Deterministic permutation of indices (seeded by epoch for reproducible shuffle)
         g = torch.Generator(device="cpu")
-        epoch = self._global_batch_idx // len(self)
-        g.manual_seed(self.seed + epoch)
+        g.manual_seed(self.seed + self._epoch)
 
         if self.shuffle:
             order = torch.randperm(self.num_samples, generator=g).tolist()
         else:
             order = list(range(self.num_samples))
 
+        batch_within_epoch = 0
         for start in range(0, self.num_samples, self.batch_size):
             end = start + self.batch_size
             if end > self.num_samples and self.drop_last:
                 break
 
-            # Get k values based on curriculum (uses global batch idx)
-            k_values = self._get_k_values_for_batch(self._global_batch_idx)
+            # Get k values based on curriculum
+            global_batch_idx = self._get_global_batch_idx(batch_within_epoch)
+            k_values = self._get_k_values_for_batch(global_batch_idx)
 
             # Uniform k from current k_values
             ki = int(torch.randint(low=0, high=len(k_values), size=(1,), generator=g).item())
@@ -471,7 +490,10 @@ class ECABatchSampler(Sampler[List[Tuple[int, int]]]):
 
             indices = order[start:min(end, self.num_samples)]
             yield [(int(i), k) for i in indices]
-            self._global_batch_idx += 1  # increment global counter
+            batch_within_epoch += 1
+        
+        # Auto-increment epoch at end of iteration (for users who don't call set_epoch)
+        self._epoch += 1
 
     def __len__(self) -> int:
         n = self.num_samples // self.batch_size
