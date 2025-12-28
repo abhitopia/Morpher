@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from morpher import (
+from models.morpher import (
     PhaseTables,
     StreamHeadAssignment,
     _route_streams_to_heads_btkni,

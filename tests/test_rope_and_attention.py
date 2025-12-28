@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from modules import RotaryEmbedding, apply_rotary_pos_emb, rotate_half
-from morpher import AttentionAdapter, AttnBackend
+from models.morpher import AttentionAdapter, AttnBackend
 
 
 def _seed_all(seed=0):

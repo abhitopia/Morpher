@@ -45,7 +45,7 @@ Notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 import hashlib
 
 import torch
@@ -108,11 +108,21 @@ class ECADataConfig:
             return int(value * self.total_batches)
         return int(value)
     
-    def create_dataloader(self, num_workers: int = 0) -> DataLoader:
+    def create_dataloader(
+        self,
+        num_workers: int = 0,
+        pin_memory: bool = False,
+        collate_fn: Optional[Callable] = None,
+    ) -> DataLoader:
         """Create a fully configured DataLoader from this config.
         
         Args:
-            num_workers: number of DataLoader workers (runtime setting, not for reproducibility)
+            num_workers: number of DataLoader workers (runtime setting)
+            pin_memory: pin memory for faster GPU transfer
+            collate_fn: optional custom collate function
+        
+        Returns:
+            DataLoader with batch_sampler accessible via loader.batch_sampler
         
         Example:
             >>> config = ECADataConfig(rules=[30, 110], L=64, total_batches=1000)
@@ -154,7 +164,9 @@ class ECADataConfig:
         return DataLoader(
             dataset,
             batch_sampler=sampler,
+            collate_fn=collate_fn,
             num_workers=num_workers,
+            pin_memory=pin_memory,
         )
 
 

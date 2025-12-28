@@ -3,7 +3,7 @@
 import pytest
 import torch
 import torch.nn as nn
-from morpher import Morpher, StreamHeadAssignment, HeadInputScope, AttnBackend, CrossStreamAttention
+from models.morpher import Morpher, StreamHeadAssignment, HeadInputScope, AttnBackend, CrossStreamAttention
 
 def _make_model(use_global_slot=True, global_slot_scale=4, d=8, N=4, cross_attn_gate_init=0.99):
     """Factory for tests."""
